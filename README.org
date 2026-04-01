@@ -1,0 +1,71 @@
+#+title: qvm.el --- Emacs interface to the qvm QEMU VM manager
+#+author: James Dyer
+#+version: 0.1.0
+
+*qvm* is an Emacs interface to the ~qvm~ QEMU VM manager shell script. It provides a convenient way to manage, start, and interact with QEMU virtual machines directly from Emacs.
+
+* Features
+
+- *VM List Buffer*: A tabulated list (~qvm-list~) showing all your VMs with their status (running/stopped), memory, CPUs, disk usage, SSH port, and VNC display.
+- *Async Operations*: VM operations (start, stop, etc.) run asynchronously, and their output is shown in a dedicated ~*qvm output*~ buffer.
+- *TRAMP Integration*: Quickly open /dired/ or an /eshell/ on a running VM via SSH (localhost tunneling).
+- *VNC Support*: Launch a VNC viewer for any running VM.
+- *File Transfer*: Easily ~scp~ files (or dired marked files) to a VM.
+- *Creation*: Create new VMs from ISO images directly from Emacs, prompting for disk size, memory, and CPU count.
+
+* Requirements
+
+- *Emacs 28.1* or newer.
+- The external *qvm* shell script must be available in your ~PATH~.
+- Built-in Emacs libraries: ~tabulated-list~, ~tramp~.
+
+* Installation
+
+** Manual
+
+Download ~qvm.el~ to your load path and add the following to your ~init.el~:
+
+#+begin_src elisp
+(require 'qvm)
+(setq qvm-base-dir "~/VM") ; adjust to your VM storage directory
+#+end_src
+
+** Using use-package
+
+#+begin_src elisp
+(use-package qvm
+  :load-path "~/source/repos/qvm"
+  :bind ("C-c v" . qvm-list)
+  :config
+  (setq qvm-base-dir "~/VM"))
+#+end_src
+
+* Usage
+
+Run ~M-x qvm-list~ to open the VM manager buffer.
+
+** Keybindings in the VM List Buffer
+
+| Key         | Action                                      |
+|-------------+---------------------------------------------|
+| ~RET~ / ~r~ | Run (start VM + open VNC viewer)            |
+| ~s~         | Start VM                                    |
+| ~x~         | Stop VM (with confirmation)                 |
+| ~c~         | Create new VM (prompts for ISO, name, etc.) |
+| ~v~         | Open VNC viewer                             |
+| ~d~         | Open dired on VM via TRAMP                  |
+| ~e~         | Open eshell on VM via TRAMP                 |
+| ~S~         | SCP marked files to VM                      |
+| ~i~         | Show VM info                                |
+| ~g~         | Refresh VM list                             |
+| ~q~         | Quit window                                 |
+
+* Customization
+
+- ~qvm-base-dir~: Directory where ~qvm~ stores VM images and configs (default: ~~/VM~).
+- ~qvm-executable~: Path to the ~qvm~ shell script (default: found in ~PATH~).
+- ~qvm-output-buffer~: Name of the buffer for command output (default: ~*qvm output*~).
+
+* License
+
+This project is licensed under the GNU General Public License v3.0 (GPLv3). See the [[file:LICENSE][LICENSE]] file for details.
