@@ -1,7 +1,7 @@
 ;;; qvm.el --- Emacs interface to the qvm QEMU VM manager -*- lexical-binding: t; -*-
 
 ;; Author: James Dyer
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Keywords: tools, qemu, vm
 ;; Package-Requires: ((emacs "28.1"))
 
@@ -12,18 +12,19 @@
 ;; Features:
 ;;   - VM list buffer (qvm-list) with keybindings for common operations
 ;;   - TRAMP integration: open shell or dired on a running VM
-;;   - Start, stop, run (start+VNC), and VNC commands
+;;   - Start, stop, run (start+viewer), VNC and SPICE commands
 ;;   - Async command output shown in a dedicated buffer
 ;;
 ;; Usage:
 ;;   M-x qvm-list     — open the VM manager buffer
 ;;
 ;; Keybindings in the VM list buffer:
-;;   RET / r  — run (start + VNC viewer)
+;;   RET / r  — run (start + viewer)
 ;;   s        — start
 ;;   x        — stop (with confirmation)
 ;;   c        — create new VM (prompts for name, ISO, disk/mem/cpus)
 ;;   v        — open VNC viewer
+;;   V        — open SPICE viewer
 ;;   d        — open dired via TRAMP
 ;;   e        — open eshell via TRAMP
 ;;   S        — scp files to VM
@@ -179,6 +180,22 @@ ON-FINISH is an optional callback called with no args when the process exits."
   (qvm--run-command (list "vnc" name)))
 
 ;;;###autoload
+(defun qvm-spice (name)
+  "Open SPICE viewer for VM NAME."
+  (interactive (list (completing-read "SPICE to VM: "
+                                      (seq-filter #'qvm--running-p (qvm--list-vms))
+                                      nil t)))
+  (qvm--run-command (list "spice" name)))
+
+;;;###autoload
+(defun qvm-keyboard (name)
+  "Setup keyboard remaps and sticky keys on VM NAME via SSH."
+  (interactive (list (completing-read "Keyboard setup for VM: "
+                                      (seq-filter #'qvm--running-p (qvm--list-vms))
+                                      nil t)))
+  (qvm--run-command (list "keyboard" name)))
+
+;;;###autoload
 (defun qvm-dired (name)
   "Open dired on VM NAME via TRAMP."
   (interactive (list (completing-read "Dired into VM: "
@@ -302,9 +319,11 @@ via `read-file-name'.  DISK, MEMORY, and CPUS are prompted with defaults."
     (define-key map (kbd "x")   #'qvm-list-stop)
     (define-key map (kbd "c")   #'qvm-list-create)
     (define-key map (kbd "v")   #'qvm-list-vnc)
+    (define-key map (kbd "V")   #'qvm-list-spice)
     (define-key map (kbd "d")   #'qvm-list-dired)
     (define-key map (kbd "e")   #'qvm-list-eshell)
     (define-key map (kbd "i")   #'qvm-list-info)
+    (define-key map (kbd "k")   #'qvm-list-keyboard)
     (define-key map (kbd "S")   #'qvm-list-scp)
     (define-key map (kbd "g")   #'qvm-list-refresh)
     (define-key map (kbd "q")   #'quit-window)
@@ -320,7 +339,8 @@ via `read-file-name'.  DISK, MEMORY, and CPUS are prompted with defaults."
          ("CPUs"     5 nil)
          ("Disk"     8 nil)
          ("SSH"      6 nil)
-         ("VNC"      5 nil)])
+         ("Display"  8 nil)
+         ("Port"     6 nil)])
   (setq tabulated-list-sort-key '("Name" . nil))
   (tabulated-list-init-header)
   (setq-local revert-buffer-function (lambda (&rest _) (qvm-list-refresh))))
@@ -338,11 +358,14 @@ via `read-file-name'.  DISK, MEMORY, and CPUS are prompted with defaults."
             (memory  (or (qvm--conf-get conf "VM_MEMORY") "?"))
             (cpus    (or (qvm--conf-get conf "VM_CPUS") "?"))
             (ssh     (or (qvm--conf-get conf "VM_SSH_PORT") "?"))
-            (vnc     (or (qvm--conf-get conf "VM_VNC_DISPLAY") "?")))
+            (display (or (qvm--conf-get conf "VM_DISPLAY") "vnc"))
+            (port    (if (string= display "spice")
+                         (or (qvm--conf-get conf "VM_SPICE_PORT") "?")
+                       (or (qvm--conf-get conf "VM_VNC_DISPLAY") "?"))))
        (list name
              (vector
               (propertize name 'face 'bold)
-              status memory cpus disk ssh vnc))))
+              status memory cpus disk ssh display port))))
    (qvm--list-vms)))
 
 (defun qvm-list-refresh ()
@@ -387,6 +410,11 @@ via `read-file-name'.  DISK, MEMORY, and CPUS are prompted with defaults."
   (interactive)
   (qvm-vnc (qvm-list--current-name)))
 
+(defun qvm-list-spice ()
+  "Open SPICE viewer for VM at point."
+  (interactive)
+  (qvm-spice (qvm-list--current-name)))
+
 (defun qvm-list-dired ()
   "Open dired on the VM at point via TRAMP."
   (interactive)
@@ -401,6 +429,11 @@ via `read-file-name'.  DISK, MEMORY, and CPUS are prompted with defaults."
   "Show info for the VM at point."
   (interactive)
   (qvm-info (qvm-list--current-name)))
+
+(defun qvm-list-keyboard ()
+  "Setup keyboard remaps and sticky keys on VM at point."
+  (interactive)
+  (qvm-keyboard (qvm-list--current-name)))
 
 (defun qvm-list-scp ()
   "SCP files to the VM at point."
@@ -431,7 +464,7 @@ via `read-file-name'.  DISK, MEMORY, and CPUS are prompted with defaults."
       (tabulated-list-print)
       (qvm-list--goto-first-entry))
     (pop-to-buffer buf)
-    (message "r=run  s=start  x=stop  c=create  v=vnc  d=dired  e=eshell  S=scp  i=info  g=refresh  q=quit")))
+    (message "r=run  s=start  x=stop  c=create  v=vnc  V=spice  k=keyboard  d=dired  e=eshell  S=scp  i=info  g=refresh  q=quit")))
 
 (provide 'qvm)
 

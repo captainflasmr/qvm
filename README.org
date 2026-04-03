@@ -1,23 +1,26 @@
 #+title: qvm.el --- Emacs interface to the qvm QEMU VM manager
 #+author: James Dyer
-#+version: 0.1.0
+#+version: 0.2.0
 
 *qvm* is an Emacs interface to the ~qvm~ QEMU VM manager shell script. It provides a convenient way to manage, start, and interact with QEMU virtual machines directly from Emacs.
 
 * Features
 
-- *VM List Buffer*: A tabulated list (~qvm-list~) showing all your VMs with their status (running/stopped), memory, CPUs, disk usage, SSH port, and VNC display.
+- *VM List Buffer*: A tabulated list (~qvm-list~) showing all your VMs with their status (running/stopped), memory, CPUs, disk usage, SSH port, and display type.
 - *Async Operations*: VM operations (start, stop, etc.) run asynchronously, and their output is shown in a dedicated ~*qvm output*~ buffer.
 - *TRAMP Integration*: Quickly open /dired/ or an /eshell/ on a running VM via SSH (localhost tunneling).
-- *VNC Support*: Launch a VNC viewer for any running VM.
+- *Display Support*: Launch VNC or SPICE viewers for any running VM. SPICE provides clipboard sharing, dynamic resolution, and better keyboard input handling.
 - *File Transfer*: Easily ~scp~ files (or dired marked files) to a VM.
-- *Creation*: Create new VMs from ISO images directly from Emacs, prompting for disk size, memory, and CPU count.
+- *Keyboard Setup*: Configure keyboard remaps (CapsLock/Right Alt → Ctrl) and sticky keys on GNOME VM guests via SSH.
+- *Creation*: Create new VMs from ISO images directly from Emacs, prompting for disk size, memory, CPU count, and display type.
 
 * Requirements
 
 - *Emacs 28.1* or newer.
 - The external *qvm* shell script must be available in your ~PATH~.
 - Built-in Emacs libraries: ~tabulated-list~, ~tramp~.
+- For VNC: ~vncviewer~
+- For SPICE: ~spicy~ (from ~spice-gtk~), and ~spice-vdagent~ inside the guest for clipboard sharing.
 
 * Installation
 
@@ -46,19 +49,54 @@ Run ~M-x qvm-list~ to open the VM manager buffer.
 
 ** Keybindings in the VM List Buffer
 
-| Key         | Action                                      |
-|-------------+---------------------------------------------|
-| ~RET~ / ~r~ | Run (start VM + open VNC viewer)            |
-| ~s~         | Start VM                                    |
-| ~x~         | Stop VM (with confirmation)                 |
-| ~c~         | Create new VM (prompts for ISO, name, etc.) |
-| ~v~         | Open VNC viewer                             |
-| ~d~         | Open dired on VM via TRAMP                  |
-| ~e~         | Open eshell on VM via TRAMP                 |
-| ~S~         | SCP marked files to VM                      |
-| ~i~         | Show VM info                                |
-| ~g~         | Refresh VM list                             |
-| ~q~         | Quit window                                 |
+| Key         | Action                                       |
+|-------------+----------------------------------------------|
+| ~RET~ / ~r~ | Run (start VM + open viewer)                 |
+| ~s~         | Start VM                                     |
+| ~x~         | Stop VM (with confirmation)                  |
+| ~c~         | Create new VM (prompts for ISO, name, etc.)  |
+| ~v~         | Open VNC viewer                              |
+| ~V~         | Open SPICE viewer                            |
+| ~k~         | Setup keyboard remaps + sticky keys          |
+| ~d~         | Open dired on VM via TRAMP                   |
+| ~e~         | Open eshell on VM via TRAMP                  |
+| ~S~         | SCP marked files to VM                       |
+| ~i~         | Show VM info                                 |
+| ~g~         | Refresh VM list                              |
+| ~q~         | Quit window                                  |
+
+** SPICE Display
+
+SPICE offers advantages over VNC for Wayland hosts (e.g. SwayWM) where host keyboard remappings do not pass through to the guest:
+
+- Clipboard sharing between host and guest (via ~spice-vdagent~)
+- Dynamic resolution resizing
+- Better input handling
+
+Create a VM with SPICE display:
+
+#+begin_src bash :tangle no
+qvm create myvm --disk 40G -m 4G --display spice
+#+end_src
+
+Existing VMs default to VNC for backward compatibility.
+
+** Keyboard Setup for VM Guests
+
+Host XKB settings (sticky keys, key remaps) do not pass through SPICE or VNC to the guest since keyboard input is sent as raw scancodes. The ~keyboard~ command configures these inside the guest via SSH:
+
+#+begin_src bash :tangle no
+qvm keyboard myvm
+#+end_src
+
+This applies to GNOME Wayland guests:
+
+- GB keyboard layout
+- CapsLock → Ctrl (via ~ctrl:nocaps~)
+- Right Alt → Ctrl (via ~ctrl:ralt_rctrl~)
+- Sticky keys enabled
+
+Log out and back in to the guest for changes to take effect.
 
 * Customization
 

@@ -6,11 +6,13 @@
 #   qvm create <name> [options]        Create a new VM
 #   qvm install <name> --iso <path>    Boot from ISO to install OS
 #   qvm start <name> [options]         Start an existing VM
-#   qvm run <name> [--offline]          Start a VM and open VNC viewer
+#   qvm run <name> [--offline]          Start a VM and open viewer
 #   qvm stop <name>                    Stop a running VM
 #   qvm ssh <name> [ssh-args...]       SSH into a VM
 #   qvm scp <name> <src> <dest>        SCP files to/from a VM (use : for remote)
 #   qvm vnc <name>                     Open VNC viewer to a VM
+#   qvm spice <name>                   Open SPICE viewer to a VM
+#   qvm keyboard <name>                Setup keyboard remaps + sticky keys
 #   qvm list                           List all VMs
 #   qvm info <name>                    Show VM configuration
 #   qvm rename <old> <new>              Rename a VM
@@ -42,6 +44,8 @@ DEFAULT_CPUS="4"
 DEFAULT_DISK="40G"
 DEFAULT_SSH_PORT="2222"
 DEFAULT_VNC_DISPLAY="1"
+DEFAULT_SPICE_PORT="5930"
+DEFAULT_DISPLAY="vnc"
 DEFAULT_USER="$USER"
 
 # ── Colours ──────────────────────────────────────────────────────
@@ -83,6 +87,9 @@ load_conf() {
     [[ -f "$conf" ]] || die "VM '$1' not found"
     # shellcheck source=/dev/null
     source "$conf"
+    # Backward compatibility for VMs created before SPICE support
+    VM_DISPLAY="${VM_DISPLAY:-vnc}"
+    VM_SPICE_PORT="${VM_SPICE_PORT:-$DEFAULT_SPICE_PORT}"
 }
 
 save_conf() {
@@ -95,6 +102,8 @@ VM_CPUS="${VM_CPUS}"
 VM_DISK_SIZE="${VM_DISK_SIZE}"
 VM_SSH_PORT="${VM_SSH_PORT}"
 VM_VNC_DISPLAY="${VM_VNC_DISPLAY}"
+VM_SPICE_PORT="${VM_SPICE_PORT}"
+VM_DISPLAY="${VM_DISPLAY}"
 VM_USER="${VM_USER}"
 EOF
 }
@@ -117,6 +126,14 @@ next_free_vnc() {
     echo "$display"
 }
 
+next_free_spice() {
+    local port="$1"
+    while ss -tlnH "sport = :$port" 2>/dev/null | grep -q .; do
+        port=$((port + 1))
+    done
+    echo "$port"
+}
+
 # ── Commands ─────────────────────────────────────────────────────
 
 cmd_create() {
@@ -126,6 +143,8 @@ cmd_create() {
     VM_DISK_SIZE="$DEFAULT_DISK"
     VM_SSH_PORT="$DEFAULT_SSH_PORT"
     VM_VNC_DISPLAY="$DEFAULT_VNC_DISPLAY"
+    VM_SPICE_PORT="$DEFAULT_SPICE_PORT"
+    VM_DISPLAY="$DEFAULT_DISPLAY"
     VM_USER="$DEFAULT_USER"
 
     while [[ $# -gt 0 ]]; do
@@ -135,6 +154,9 @@ cmd_create() {
             --disk)         VM_DISK_SIZE="$2"; shift 2 ;;
             -p|--ssh-port)  VM_SSH_PORT="$2"; shift 2 ;;
             --vnc)          VM_VNC_DISPLAY="$2"; shift 2 ;;
+            --display)
+                [[ "$2" == "vnc" || "$2" == "spice" ]] || die "--display must be 'vnc' or 'spice'"
+                VM_DISPLAY="$2"; shift 2 ;;
             -u|--user)      VM_USER="$2"; shift 2 ;;
             -*)             die "Unknown option: $1" ;;
             *)
@@ -150,13 +172,19 @@ cmd_create() {
     # Auto-assign ports to avoid collisions
     VM_SSH_PORT="$(next_free_port "$VM_SSH_PORT")"
     VM_VNC_DISPLAY="$(next_free_vnc "$VM_VNC_DISPLAY")"
+    VM_SPICE_PORT="$(next_free_spice "$VM_SPICE_PORT")"
 
     info "Creating VM '${BOLD}$name${RESET}'"
     echo "  Disk:    $VM_DISK_SIZE"
     echo "  Memory:  $VM_MEMORY"
     echo "  CPUs:    $VM_CPUS"
+    echo "  Display: $VM_DISPLAY"
     echo "  SSH:     localhost:$VM_SSH_PORT"
-    echo "  VNC:     :$VM_VNC_DISPLAY (port $((5900 + VM_VNC_DISPLAY)))"
+    if [[ "$VM_DISPLAY" == "spice" ]]; then
+        echo "  SPICE:   localhost:$VM_SPICE_PORT"
+    else
+        echo "  VNC:     :$VM_VNC_DISPLAY (port $((5900 + VM_VNC_DISPLAY)))"
+    fi
     echo "  User:    $VM_USER"
     echo ""
 
@@ -192,10 +220,34 @@ cmd_install() {
 
     info "Installing from ISO into '${BOLD}$name${RESET}'"
     echo "  ISO:     $iso"
-    echo "  VNC:     localhost:$((5900 + VM_VNC_DISPLAY))"
+    if [[ "$VM_DISPLAY" == "spice" ]]; then
+        echo "  SPICE:   localhost:$VM_SPICE_PORT"
+        echo ""
+        echo "  Connect with:  ${BOLD}spicy -h localhost -p $VM_SPICE_PORT${RESET}"
+    else
+        echo "  VNC:     localhost:$((5900 + VM_VNC_DISPLAY))"
+        echo ""
+        echo "  Connect with:  ${BOLD}vncviewer localhost:$((5900 + VM_VNC_DISPLAY))${RESET}"
+    fi
     echo ""
-    echo "  Connect with:  ${BOLD}vncviewer localhost:$((5900 + VM_VNC_DISPLAY))${RESET}"
-    echo ""
+
+    local display_args
+    if [[ "$VM_DISPLAY" == "spice" ]]; then
+        display_args=(
+            -spice "port=${VM_SPICE_PORT},disable-ticketing=on"
+            -device virtio-serial-pci
+            -chardev "spicevmc,id=vdagent,name=vdagent"
+            -device "virtserialport,chardev=vdagent,name=com.redhat.spice.0"
+            -display none
+            -vga qxl
+        )
+    else
+        display_args=(
+            -vnc ":${VM_VNC_DISPLAY}"
+            -display none
+            -vga virtio
+        )
+    fi
 
     qemu-system-x86_64 \
         -enable-kvm \
@@ -206,9 +258,7 @@ cmd_install() {
         -cdrom "$iso" \
         -boot d \
         -nic "user,hostfwd=tcp::${VM_SSH_PORT}-:22" \
-        -vnc ":${VM_VNC_DISPLAY}" \
-        -display none \
-        -vga virtio &
+        "${display_args[@]}" &
 
     local pid=$!
     echo "$pid" > "$(vm_pid "$name")"
@@ -254,14 +304,41 @@ cmd_start() {
 
     if $offline; then
         echo "  Network: ${RED}disabled${RESET}"
-        echo "  VNC:     localhost:$((5900 + VM_VNC_DISPLAY))"
-        echo ""
-        echo "  Connect with:  ${BOLD}vncviewer localhost:$((5900 + VM_VNC_DISPLAY))${RESET}"
     else
         echo "  SSH:     ${BOLD}qvm ssh $name${RESET}  (localhost:$VM_SSH_PORT)"
+    fi
+    if [[ "$VM_DISPLAY" == "spice" ]]; then
+        echo "  SPICE:   localhost:$VM_SPICE_PORT"
+        if $offline; then
+            echo ""
+            echo "  Connect with:  ${BOLD}spicy -h localhost -p $VM_SPICE_PORT${RESET}"
+        fi
+    else
         echo "  VNC:     localhost:$((5900 + VM_VNC_DISPLAY))"
+        if $offline; then
+            echo ""
+            echo "  Connect with:  ${BOLD}vncviewer localhost:$((5900 + VM_VNC_DISPLAY))${RESET}"
+        fi
     fi
     echo ""
+
+    local display_args
+    if [[ "$VM_DISPLAY" == "spice" ]]; then
+        display_args=(
+            -spice "port=${VM_SPICE_PORT},disable-ticketing=on"
+            -device virtio-serial-pci
+            -chardev "spicevmc,id=vdagent,name=vdagent"
+            -device "virtserialport,chardev=vdagent,name=com.redhat.spice.0"
+            -display none
+            -vga qxl
+        )
+    else
+        display_args=(
+            -vnc ":${VM_VNC_DISPLAY}"
+            -display none
+            -vga virtio
+        )
+    fi
 
     # shellcheck disable=SC2086
     qemu-system-x86_64 \
@@ -271,9 +348,7 @@ cmd_start() {
         -cpu host \
         -drive "file=$(vm_disk "$name"),format=qcow2" \
         $nic_opts \
-        -vnc ":${VM_VNC_DISPLAY}" \
-        -display none \
-        -vga virtio &
+        "${display_args[@]}" &
 
     local pid=$!
     echo "$pid" > "$(vm_pid "$name")"
@@ -302,9 +377,15 @@ cmd_run() {
 
     cmd_start "${start_args[@]}"
 
-    # Give QEMU a moment to open the VNC socket
+    # Give QEMU a moment to open the display socket
     sleep 1
-    cmd_vnc "$name"
+
+    load_conf "$name"
+    if [[ "$VM_DISPLAY" == "spice" ]]; then
+        cmd_spice "$name"
+    else
+        cmd_vnc "$name"
+    fi
 }
 
 cmd_stop() {
@@ -404,12 +485,51 @@ cmd_vnc() {
     vncviewer "localhost:$vnc_port" -RemoteResize=1
 }
 
+cmd_spice() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "Usage: qvm spice <name>"
+    vm_exists "$name" || die "VM '$name' not found"
+    vm_running "$name" || die "VM '$name' is not running. Start it first: qvm start $name"
+
+    load_conf "$name"
+
+    info "Connecting to '${BOLD}$name${RESET}' via SPICE (localhost:$VM_SPICE_PORT)"
+    spicy -h localhost -p "$VM_SPICE_PORT"
+}
+
+cmd_keyboard() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || die "Usage: qvm keyboard <name>"
+    vm_exists "$name" || die "VM '$name' not found"
+    vm_running "$name" || die "VM '$name' is not running"
+
+    load_conf "$name"
+
+    info "Configuring keyboard for '${BOLD}$name${RESET}'"
+
+    local ssh_cmd=(ssh -p "$VM_SSH_PORT" -o StrictHostKeyChecking=accept-new "${VM_USER}@localhost")
+
+    echo "  Layout:      GB"
+    "${ssh_cmd[@]}" gsettings set org.gnome.desktop.input-sources sources \
+        "\"[('xkb', 'gb')]\"" 2>/dev/null
+
+    echo "  Remappings:  CapsLock → Ctrl, Right Alt → Ctrl"
+    "${ssh_cmd[@]}" gsettings set org.gnome.desktop.input-sources xkb-options \
+        "\"['ctrl:nocaps','ctrl:ralt_rctrl']\"" 2>/dev/null
+
+    echo "  Sticky keys: enabled"
+    "${ssh_cmd[@]}" gsettings set org.gnome.desktop.a11y.keyboard stickykeys-enable true 2>/dev/null
+
+    echo ""
+    info "Done. Log out and back in to the VM for changes to take effect."
+}
+
 cmd_list() {
     [[ -d "$VM_BASE" ]] || { echo "No VMs found."; return 0; }
 
     local has_vms=false
-    printf "${BOLD}%-20s %-8s %-6s %-6s %-10s %-8s %s${RESET}\n" \
-        "NAME" "STATUS" "MEM" "CPUS" "DISK" "SSH" "VNC"
+    printf "${BOLD}%-20s %-8s %-6s %-6s %-10s %-8s %-8s %s${RESET}\n" \
+        "NAME" "STATUS" "MEM" "CPUS" "DISK" "SSH" "DISPLAY" "PORT"
 
     for dir in "$VM_BASE"/*/; do
         [[ -d "$dir" ]] || continue
@@ -421,6 +541,8 @@ cmd_list() {
         has_vms=true
         # shellcheck source=/dev/null
         source "$conf"
+        VM_DISPLAY="${VM_DISPLAY:-vnc}"
+        VM_SPICE_PORT="${VM_SPICE_PORT:-$DEFAULT_SPICE_PORT}"
 
         local status
         if vm_running "$name"; then
@@ -432,9 +554,16 @@ cmd_list() {
         local disk_actual
         disk_actual="$(du -sh "$dir/disk.qcow2" 2>/dev/null | cut -f1 || echo "?")"
 
-        printf "%-20s %-18b %-6s %-6s %-10s %-8s %s\n" \
+        local display_port
+        if [[ "$VM_DISPLAY" == "spice" ]]; then
+            display_port=":$VM_SPICE_PORT"
+        else
+            display_port=":$VM_VNC_DISPLAY"
+        fi
+
+        printf "%-20s %-18b %-6s %-6s %-10s %-8s %-8s %s\n" \
             "$name" "$status" "$VM_MEMORY" "$VM_CPUS" "$disk_actual" \
-            ":$VM_SSH_PORT" ":$VM_VNC_DISPLAY"
+            ":$VM_SSH_PORT" "$VM_DISPLAY" "$display_port"
     done
 
     $has_vms || echo "No VMs found."
@@ -463,12 +592,21 @@ cmd_info() {
     echo "  Disk:      $(vm_disk "$name") ($disk_actual used / $VM_DISK_SIZE max)"
     echo "  Memory:    $VM_MEMORY"
     echo "  CPUs:      $VM_CPUS"
+    echo "  Display:   $VM_DISPLAY"
     echo "  SSH port:  $VM_SSH_PORT"
-    echo "  VNC:       :$VM_VNC_DISPLAY (port $((5900 + VM_VNC_DISPLAY)))"
+    if [[ "$VM_DISPLAY" == "spice" ]]; then
+        echo "  SPICE:     localhost:$VM_SPICE_PORT"
+    else
+        echo "  VNC:       :$VM_VNC_DISPLAY (port $((5900 + VM_VNC_DISPLAY)))"
+    fi
     echo "  User:      $VM_USER"
     echo ""
     echo "  SSH:       qvm ssh $name"
-    echo "  VNC:       vncviewer localhost:$((5900 + VM_VNC_DISPLAY))"
+    if [[ "$VM_DISPLAY" == "spice" ]]; then
+        echo "  SPICE:     spicy -h localhost -p $VM_SPICE_PORT"
+    else
+        echo "  VNC:       vncviewer localhost:$((5900 + VM_VNC_DISPLAY))"
+    fi
     echo "  TRAMP:     /ssh:${VM_USER}@localhost#${VM_SSH_PORT}:/home/${VM_USER}/"
 }
 
@@ -517,11 +655,13 @@ Usage:
   qvm create <name> [options]        Create a new VM
   qvm install <name> --iso <path>    Boot from ISO to install OS
   qvm start <name> [--offline]       Start a VM
-  qvm run <name> [--offline]          Start a VM and open VNC viewer
+  qvm run <name> [--offline]          Start a VM and open viewer
   qvm stop <name>                    Stop a VM
   qvm ssh <name> [args...]           SSH into a VM
   qvm scp <name> <src> <dest>        Copy files (: prefix = remote)
   qvm vnc <name>                     Open VNC viewer to a VM
+  qvm spice <name>                   Open SPICE viewer to a VM
+  qvm keyboard <name>                Setup keyboard remaps + sticky keys
   qvm list                           List all VMs
   qvm info <name>                    Show VM details
   qvm rename <old> <new>             Rename a VM
@@ -531,12 +671,14 @@ Create options:
   -m, --memory <size>    RAM size         (default: 4G)
   --cpus <n>             CPU count        (default: 4)
   --disk <size>          Disk size        (default: 40G)
+  --display <type>       vnc or spice     (default: vnc)
   -p, --ssh-port <port>  SSH port on host (default: 2222, auto-increments)
   --vnc <display>        VNC display      (default: 1, auto-increments)
   -u, --user <name>      SSH username     (default: $USER)
 
 Examples:
   qvm create leap15 --disk 40G -m 4G
+  qvm create leap15 --disk 40G -m 4G --display spice
   qvm install leap15 --iso ~/Downloads/openSUSE-Leap-15.4-DVD-x86_64-Media.iso
   qvm start leap15
   qvm ssh leap15
@@ -558,6 +700,8 @@ case "$cmd" in
     ssh)        cmd_ssh "$@" ;;
     scp)        cmd_scp "$@" ;;
     vnc)        cmd_vnc "$@" ;;
+    spice)      cmd_spice "$@" ;;
+    keyboard)   cmd_keyboard "$@" ;;
     list|ls)    cmd_list "$@" ;;
     info)       cmd_info "$@" ;;
     rename|mv)  cmd_rename "$@" ;;
