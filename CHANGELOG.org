@@ -1,0 +1,45 @@
+#+title: Changelog
+#+author: James Dyer
+
+* 0.2.0 — <2026-04-03>
+
+SPICE display support, keyboard setup command, and Emacs UI updates.
+
+** Added
+
+- SPICE display backend as an alternative to VNC (~--display spice~ on ~qvm create~)
+  - Uses QXL graphics with ~spice-vdagent~ for clipboard sharing and dynamic resolution
+  - ~qvm spice <name>~ command to open SPICE viewer (~spicy~)
+  - ~qvm run~ auto-selects the correct viewer based on VM display type
+- ~qvm keyboard <name>~ command to configure keyboard remaps and sticky keys on GNOME Wayland guests via SSH
+  - GB layout, CapsLock → Ctrl, Right Alt → Ctrl, sticky keys
+- Emacs: ~qvm-spice~ command and ~V~ keybinding in list buffer
+- Emacs: ~qvm-keyboard~ command and ~k~ keybinding in list buffer
+- ~VM_DISPLAY~ and ~VM_SPICE_PORT~ fields in ~vm.conf~
+
+** Changed
+
+- Emacs: list buffer columns updated from "VNC" to "Display" and "Port"
+- ~qvm list~ and ~qvm info~ now show display type and corresponding port
+- Bumped ~qvm.el~ version to 0.2.0
+
+** Backward Compatibility
+
+- Existing VMs without ~VM_DISPLAY~ in their config default to ~vnc~
+- No changes required to existing VM configurations
+
+* 0.1.0 — <2026-04-01>
+
+Initial release.
+
+** Added
+
+- ~qvm~ shell script: Docker-inspired CLI for managing QEMU VMs
+  - create, install, start, run, stop, ssh, scp, vnc, list, info, rename, rm
+  - VNC display with auto-assigned ports
+  - User-mode networking with SSH port forwarding
+- ~qvm.el~ Emacs interface
+  - Tabulated list buffer with keybindings for all operations
+  - TRAMP integration for dired and eshell
+  - Async command output buffer
+  - VM creation from ISO with dired integration
