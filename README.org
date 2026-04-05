@@ -1,8 +1,8 @@
-#+title: qvm.el --- Emacs interface to the qvm QEMU VM manager
+#+title: qvm.el --- QEMU VM manager for Emacs
 #+author: James Dyer
-#+version: 0.5.0
+#+version: 1.0.0
 
-*qvm* is an Emacs interface to the ~qvm~ QEMU VM manager shell script. It provides a convenient way to manage, start, and interact with QEMU virtual machines directly from Emacs.
+*qvm.el* manages QEMU virtual machines directly from Emacs. It calls ~qemu-system-x86_64~, ~qemu-img~, ~vncviewer~, ~spicy~, ~ssh~, and ~rsync~ directly -- no external wrapper script required.
 
 * Features
 
@@ -11,7 +11,7 @@
 - *Async Operations*: VM operations (start, stop, etc.) run asynchronously, and their output is shown in a dedicated ~*qvm output*~ buffer.
 - *TRAMP Integration*: Quickly open /dired/ or an /eshell/ on a running VM via SSH (localhost tunneling).
 - *Display Support*: Launch VNC or SPICE viewers for any running VM. SPICE provides clipboard sharing, dynamic resolution, and better keyboard input handling.
-- *File Transfer*: Easily ~scp~ files (or dired marked files) to a VM.
+- *File Transfer*: Easily rsync files (or dired marked files) to a VM.
 - *Clipboard Sharing*: Copy/paste between host and VM over SSH (~w~ / ~y~), with auto-detection of guest clipboard tools (wl-clipboard, xclip, xsel). Works with both VNC and SPICE.
 - *Keyboard Setup*: Configure keyboard remaps (CapsLock/Right Alt → Ctrl) and sticky keys on GNOME VM guests via SSH.
 - *Display Switching*: Toggle between VNC and SPICE display types without recreating the VM.
@@ -21,12 +21,22 @@
 
 * Requirements
 
-- *Emacs 28.1* or newer.
-- The external *qvm* shell script must be available in your ~PATH~.
-- Built-in Emacs libraries: ~tabulated-list~, ~tramp~, ~transient~ (bundled with Emacs 29+, or available from MELPA).
-- For VNC: ~vncviewer~
-- For SPICE: ~spicy~ (from ~spice-gtk~), and ~spice-vdagent~ inside the guest for clipboard sharing.
-- For clipboard over SSH: ~wl-clipboard~ on the host, and ~wl-clipboard~ or ~xclip~ inside the guest.
+- *Emacs 28.1* or newer
+- *transient* 0.4.0+ (bundled with Emacs 29+, or available from MELPA)
+- Built-in Emacs libraries: ~tabulated-list~, ~tramp~
+
+External tools (must be in ~PATH~):
+
+| Tool                   | Used for                                 |
+|------------------------+------------------------------------------|
+| ~qemu-system-x86_64~  | Running VMs                              |
+| ~qemu-img~            | Creating disks, snapshots, linked clones |
+| ~ss~                  | Port availability checking               |
+| ~vncviewer~           | VNC display (e.g. TigerVNC)              |
+| ~spicy~               | SPICE display (from ~spice-gtk~)         |
+| ~ssh~ / ~ssh-copy-id~ | Remote commands, key setup                |
+| ~rsync~               | File transfer to VMs                     |
+| ~wl-copy~ / ~wl-paste~| Host clipboard (Wayland)                 |
 
 * Installation
 
@@ -51,7 +61,7 @@ Download ~qvm.el~ to your load path and add the following to your ~init.el~:
 
 * Usage
 
-Run ~M-x qvm-list~ to open the VM manager buffer, then press ~?~ to open the transient menu. You can also run ~M-x qvm-menu~ from anywhere — outside the list buffer it offers a minimal set of commands that prompt for a VM name.
+Run ~M-x qvm-list~ to open the VM manager buffer, then press ~?~ to open the transient menu. You can also run ~M-x qvm-menu~ from anywhere -- outside the list buffer it offers a minimal set of commands that prompt for a VM name.
 
 ** Keybindings in the VM List Buffer
 
@@ -77,6 +87,7 @@ Run ~M-x qvm-list~ to open the VM manager buffer, then press ~?~ to open the tra
 | ~d~         | Open dired on VM via TRAMP                   |
 | ~e~         | Open eshell on VM via TRAMP                  |
 | ~S~         | SCP marked files to VM                       |
+| ~P~         | Push SSH key for passwordless access         |
 | ~i~         | Show VM info                                 |
 | ~g~         | Refresh VM list                              |
 | ~q~         | Quit window                                  |
@@ -84,31 +95,17 @@ Run ~M-x qvm-list~ to open the VM manager buffer, then press ~?~ to open the tra
 
 ** Snapshots
 
-Create, list, restore, and delete internal qcow2 snapshots on stopped VMs:
-
-#+begin_src bash :tangle no
-qvm snapshot myvm create base-install   # create a snapshot
-qvm snapshot myvm list                  # list all snapshots
-qvm snapshot myvm restore base-install  # restore to a snapshot
-qvm snapshot myvm delete base-install   # delete a snapshot
-#+end_src
+Create, list, restore, and delete internal qcow2 snapshots on stopped VMs.
 
 In the Emacs list buffer, ~+~ creates a snapshot and ~R~ / ~X~ restore / delete with completing-read over existing tags. ~N~ lists all snapshots for the VM at point.
 
 ** Cloning
 
-Clone a stopped VM as either a full independent copy or a linked (copy-on-write) clone:
+Clone a stopped VM as either a full independent copy or a linked (copy-on-write) clone. Press ~C~ in the list buffer.
 
-#+begin_src bash :tangle no
-qvm clone myvm myvm-copy              # full clone (copies entire disk)
-qvm clone myvm myvm-dev --linked      # linked clone (fast, shares source disk)
-#+end_src
-
-Full clones are independent but take time and disk space proportional to the source disk. Linked clones are instant and space-efficient, but depend on the source disk — if the source is deleted or corrupted, the linked clone breaks.
+Full clones are independent but take time and disk space proportional to the source disk. Linked clones are instant and space-efficient, but depend on the source disk -- if the source is deleted or corrupted, the linked clone breaks.
 
 New ports (SSH, VNC, SPICE) are auto-assigned to avoid collisions.
-
-In the Emacs list buffer, press ~C~ to clone the VM at point.
 
 ** SPICE Display
 
@@ -118,21 +115,13 @@ SPICE offers advantages over VNC for Wayland hosts (e.g. SwayWM) where host keyb
 - Dynamic resolution resizing
 - Better input handling
 
-Create a VM with SPICE display:
+Toggle an existing VM between display types with ~D~ in the list buffer, or:
 
-#+begin_src bash :tangle no
-qvm create myvm --disk 40G -m 4G --display spice
+#+begin_src elisp
+(qvm-display "myvm") ; toggles between vnc and spice
 #+end_src
 
 Existing VMs default to VNC for backward compatibility.
-
-Switch an existing VM between display types:
-
-#+begin_src bash :tangle no
-qvm display myvm spice    # switch to spice
-qvm display myvm vnc      # switch to vnc
-qvm display myvm           # show current type
-#+end_src
 
 *** SwayWM: Keyboard Shortcut Passthrough
 
@@ -146,11 +135,7 @@ Reload sway (~swaymsg reload~) and restart the SPICE viewer for the change to ta
 
 ** Keyboard Setup for VM Guests
 
-Host XKB settings (sticky keys, key remaps) do not pass through SPICE or VNC to the guest since keyboard input is sent as raw scancodes. The ~keyboard~ command configures these inside the guest via SSH:
-
-#+begin_src bash :tangle no
-qvm keyboard myvm
-#+end_src
+Host XKB settings (sticky keys, key remaps) do not pass through SPICE or VNC to the guest since keyboard input is sent as raw scancodes. The keyboard command configures these inside the guest via SSH (~k~ in list buffer):
 
 This applies to GNOME Wayland guests:
 
@@ -165,21 +150,32 @@ Log out and back in to the guest for changes to take effect.
 
 SPICE provides native clipboard sharing via ~spice-vdagent~. For VNC mode (or as a fallback), clipboard can be shared over SSH:
 
-#+begin_src bash :tangle no
-qvm clip myvm copy      # VM clipboard → host
-qvm clip myvm paste     # host clipboard → VM
-qvm clip myvm install   # install clipboard tools on the guest
-#+end_src
+- ~w~ in the list buffer copies VM clipboard → host (kill ring + system clipboard)
+- ~y~ pastes host clipboard → VM
+- ~I~ installs clipboard tools on the guest (auto-detects package manager)
 
-The ~install~ subcommand auto-detects the guest package manager (zypper, apt, dnf, pacman, apk) and installs both ~wl-clipboard~ and ~xclip~. The ~copy~ and ~paste~ subcommands auto-detect which clipboard tool is available on the guest (~wl-paste~ / ~wl-copy~ for Wayland, ~xclip~ or ~xsel~ for X11).
+The copy and paste commands auto-detect which clipboard tool is available on the guest (~wl-paste~ / ~wl-copy~ for Wayland, ~xclip~ or ~xsel~ for X11).
 
 Requires ~wl-copy~ / ~wl-paste~ on the host (included with sway).
 
 * Customization
 
-- ~qvm-base-dir~: Directory where ~qvm~ stores VM images and configs (default: ~~/VM~).
-- ~qvm-executable~: Path to the ~qvm~ shell script (default: found in ~PATH~).
-- ~qvm-output-buffer~: Name of the buffer for command output (default: ~*qvm output*~).
+| Variable                    | Description                                  | Default                        |
+|-----------------------------+----------------------------------------------+--------------------------------|
+| ~qvm-base-dir~             | Directory where VMs are stored               | =~/VM=                         |
+| ~qvm-qemu-binary~          | Path to QEMU system emulator                 | =qemu-system-x86_64= in PATH  |
+| ~qvm-vnc-viewer~           | VNC viewer program                           | =vncviewer= in PATH           |
+| ~qvm-vnc-viewer-args~      | Extra args for VNC viewer                    | =("-RemoteResize=1")=          |
+| ~qvm-spice-viewer~         | SPICE viewer program                         | =spicy= in PATH               |
+| ~qvm-default-memory~       | Default memory for new VMs                   | ="4G"=                         |
+| ~qvm-default-cpus~         | Default CPU count for new VMs                | ="4"=                          |
+| ~qvm-default-disk~         | Default disk size for new VMs                | ="40G"=                        |
+| ~qvm-default-ssh-port~     | Starting SSH port for auto-assignment        | =2222=                         |
+| ~qvm-default-vnc-display~  | Starting VNC display for auto-assignment     | =1=                            |
+| ~qvm-default-spice-port~   | Starting SPICE port for auto-assignment      | =5930=                         |
+| ~qvm-default-display~      | Default display type (="vnc"= or ="spice"=)  | ="vnc"=                        |
+| ~qvm-default-user~         | Default SSH username for new VMs             | Current login name             |
+| ~qvm-output-buffer~        | Buffer name for command output               | ="*qvm output*"=              |
 
 * License
 

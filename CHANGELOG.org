@@ -1,6 +1,43 @@
 #+title: Changelog
 #+author: James Dyer
 
+* 1.0.0 — <2026-04-05>
+
+Pure Elisp rewrite -- removed dependency on the =qvm= bash script.
+
+** Changed
+
+- ~qvm.el~ now calls QEMU tools (~qemu-system-x86_64~, ~qemu-img~), SSH utilities, and display viewers directly -- the external ~qvm~ shell script is no longer required
+- ~qvm-start~ builds QEMU command-line arguments in Elisp and launches via ~make-process~ with PID file management and automatic cleanup on exit
+- ~qvm-stop~ uses ~signal-process~ (SIGTERM) with timer-based polling, escalating to SIGKILL after 10 seconds
+- ~qvm-info~ now renders VM details purely in Elisp (no external process)
+- ~qvm-display~ toggles display type by updating ~vm.conf~ directly (no external process)
+- ~qvm-create~ chains ~qemu-img create~ -> config write -> QEMU ISO boot via async callbacks
+- ~qvm-clone~ calls ~qemu-img create~ (linked) or ~cp~ (full) directly, with auto-assigned ports
+- ~qvm-snapshot-*~ commands call ~qemu-img snapshot~ directly
+- ~qvm-vnc~ / ~qvm-spice~ launch viewer programs directly
+- ~qvm-keyboard~ runs gsettings commands via a single SSH call
+- ~qvm-clip-copy~ / ~qvm-clip-paste~ use synchronous SSH + ~wl-copy~ / ~wl-paste~
+- ~qvm-ssh-copy-id~ runs ~ssh-copy-id~ directly in a term buffer; a sentinel handles permission fixing and SSH config entry creation
+- Clip install runs ~ssh -t~ directly in a term buffer with package manager detection
+
+** Added
+
+- ~qvm-qemu-binary~ customization (path to ~qemu-system-x86_64~)
+- ~qvm-vnc-viewer~ / ~qvm-vnc-viewer-args~ / ~qvm-spice-viewer~ customizations for viewer programs
+- ~qvm-default-memory~ / ~qvm-default-cpus~ / ~qvm-default-disk~ customizations for VM creation defaults
+- ~qvm-default-ssh-port~ / ~qvm-default-vnc-display~ / ~qvm-default-spice-port~ for port auto-assignment starting values
+- ~qvm-default-display~ / ~qvm-default-user~ customizations
+- Port allocation helpers (~qvm--next-free-port~, ~qvm--next-free-vnc~) using ~ss~ to detect used ports
+- Config writing (~qvm--write-conf~, ~qvm--update-conf-value~) for creating and modifying ~vm.conf~ from Elisp
+- QEMU process launcher (~qvm--start-qemu~) with PID file lifecycle, sentinel cleanup, and automatic list refresh on VM exit
+
+** Removed
+
+- ~qvm-executable~ customization variable
+- ~qvm--run-command~ function (replaced by ~qvm--run-process~ which takes a program + args directly)
+- Dependency on the external ~qvm~ shell script
+
 * 0.5.0 — <2026-04-05>
 
 Transient menu for discoverable command access.

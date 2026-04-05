@@ -1,13 +1,15 @@
-;;; qvm.el --- Emacs interface to the qvm QEMU VM manager -*- lexical-binding: t; -*-
+;;; qvm.el --- QEMU VM manager for Emacs -*- lexical-binding: t; -*-
 
 ;; Author: James Dyer
-;; Version: 0.5.0
+;; Version: 1.0.0
 ;; Keywords: tools, qemu, vm
 ;; Package-Requires: ((emacs "28.1") (transient "0.4.0"))
 
 ;;; Commentary:
 
-;; Provides an Emacs interface to the qvm shell script.
+;; Manages QEMU virtual machines directly from Emacs.
+;; Calls qemu-system-x86_64, qemu-img, vncviewer, spicy, and ssh
+;; directly -- no external wrapper script required.
 ;;
 ;; Features:
 ;;   - VM list buffer (qvm-list) with keybindings for common operations
@@ -17,29 +19,29 @@
 ;;   - Async command output shown in a dedicated buffer
 ;;
 ;; Usage:
-;;   M-x qvm-list     — open the VM manager buffer
-;;   M-x qvm-menu     — open the transient menu (also ? in list buffer)
+;;   M-x qvm-list     -- open the VM manager buffer
+;;   M-x qvm-menu     -- open the transient menu (also ? in list buffer)
 ;;
 ;; Keybindings in the VM list buffer:
-;;   RET / r  — run (start + viewer)
-;;   s        — start
-;;   x        — stop (with confirmation)
-;;   c        — create new VM (prompts for name, ISO, disk/mem/cpus)
-;;   v        — open VNC viewer
-;;   V        — open SPICE viewer
-;;   d        — open dired via TRAMP
-;;   e        — open eshell via TRAMP
-;;   S        — rsync files to VM
-;;   P        — push SSH key to VM (passwordless access)
-;;   C        — clone VM
-;;   +        — create snapshot
-;;   N        — list snapshots
-;;   R        — restore snapshot
-;;   X        — delete snapshot
-;;   i        — show VM info
-;;   g        — refresh
-;;   q        — quit
-;;   ?        — transient menu
+;;   RET / r  -- run (start + viewer)
+;;   s        -- start
+;;   x        -- stop (with confirmation)
+;;   c        -- create new VM (prompts for name, ISO, disk/mem/cpus)
+;;   v        -- open VNC viewer
+;;   V        -- open SPICE viewer
+;;   d        -- open dired via TRAMP
+;;   e        -- open eshell via TRAMP
+;;   S        -- rsync files to VM
+;;   P        -- push SSH key to VM (passwordless access)
+;;   C        -- clone VM
+;;   +        -- create snapshot
+;;   N        -- list snapshots
+;;   R        -- restore snapshot
+;;   X        -- delete snapshot
+;;   i        -- show VM info
+;;   g        -- refresh
+;;   q        -- quit
+;;   ?        -- transient menu
 ;;
 ;; Add to your init.el:
 ;;   (use-package qvm
@@ -52,39 +54,115 @@
 (require 'transient)
 (require 'tramp)
 
+;; ── Customization ────────────────────────────────────────────────────────────
+
 (defgroup qvm nil
-  "QEMU VM manager interface."
+  "QEMU VM manager."
   :group 'tools
   :prefix "qvm-")
 
 (defcustom qvm-base-dir (expand-file-name "~/VM")
-  "Directory where qvm stores VM images and configs."
+  "Directory where VMs are stored."
   :type 'directory
   :group 'qvm)
 
-(defcustom qvm-executable (executable-find "qvm")
-  "Path to the qvm shell script."
+(defcustom qvm-qemu-binary (or (executable-find "qemu-system-x86_64")
+                                "qemu-system-x86_64")
+  "Path to the QEMU system emulator."
   :type 'file
   :group 'qvm)
 
-(defcustom qvm-output-buffer "*qvm output*"
-  "Buffer name for qvm command output."
+(defcustom qvm-vnc-viewer (or (executable-find "vncviewer") "vncviewer")
+  "Path to the VNC viewer program."
+  :type 'file
+  :group 'qvm)
+
+(defcustom qvm-vnc-viewer-args '("-RemoteResize=1")
+  "Extra arguments passed to the VNC viewer."
+  :type '(repeat string)
+  :group 'qvm)
+
+(defcustom qvm-spice-viewer (or (executable-find "spicy") "spicy")
+  "Path to the SPICE viewer program."
+  :type 'file
+  :group 'qvm)
+
+(defcustom qvm-default-memory "4G"
+  "Default memory size for new VMs."
   :type 'string
   :group 'qvm)
 
-;; ── VM config parsing ─────────────────────────────────────────────────────────
+(defcustom qvm-default-cpus "4"
+  "Default CPU count for new VMs."
+  :type 'string
+  :group 'qvm)
+
+(defcustom qvm-default-disk "40G"
+  "Default disk size for new VMs."
+  :type 'string
+  :group 'qvm)
+
+(defcustom qvm-default-ssh-port 2222
+  "Starting SSH port for auto-assignment."
+  :type 'integer
+  :group 'qvm)
+
+(defcustom qvm-default-vnc-display 1
+  "Starting VNC display number for auto-assignment."
+  :type 'integer
+  :group 'qvm)
+
+(defcustom qvm-default-spice-port 5930
+  "Starting SPICE port for auto-assignment."
+  :type 'integer
+  :group 'qvm)
+
+(defcustom qvm-default-display "vnc"
+  "Default display type for new VMs."
+  :type '(choice (const "vnc") (const "spice"))
+  :group 'qvm)
+
+(defcustom qvm-default-user (user-login-name)
+  "Default SSH username for new VMs."
+  :type 'string
+  :group 'qvm)
+
+(defcustom qvm-output-buffer "*qvm output*"
+  "Buffer name for command output."
+  :type 'string
+  :group 'qvm)
+
+;; ── Path helpers ─────────────────────────────────────────────────────────────
+
+(defun qvm--vm-dir (name)
+  "Return the directory path for VM NAME."
+  (expand-file-name name qvm-base-dir))
+
+(defun qvm--vm-conf (name)
+  "Return the config file path for VM NAME."
+  (expand-file-name "vm.conf" (qvm--vm-dir name)))
+
+(defun qvm--vm-disk (name)
+  "Return the disk image path for VM NAME."
+  (expand-file-name "disk.qcow2" (qvm--vm-dir name)))
+
+(defun qvm--vm-pid (name)
+  "Return the PID file path for VM NAME."
+  (expand-file-name "qvm.pid" (qvm--vm-dir name)))
+
+;; ── Config parsing ───────────────────────────────────────────────────────────
 
 (defun qvm--list-vms ()
   "Return a list of VM names found in `qvm-base-dir'."
   (when (file-directory-p qvm-base-dir)
     (seq-filter
      (lambda (name)
-       (file-exists-p (expand-file-name (concat name "/vm.conf") qvm-base-dir)))
+       (file-exists-p (qvm--vm-conf name)))
      (directory-files qvm-base-dir nil "^[^.]"))))
 
 (defun qvm--read-conf (name)
   "Read vm.conf for VM NAME and return an alist of key/value pairs."
-  (let ((conf-file (expand-file-name (concat name "/vm.conf") qvm-base-dir))
+  (let ((conf-file (qvm--vm-conf name))
         result)
     (when (file-exists-p conf-file)
       (with-temp-buffer
@@ -98,20 +176,51 @@
   "Get KEY from parsed conf alist CONF."
   (cdr (assoc key conf)))
 
+(defun qvm--write-conf (name conf)
+  "Write CONF alist to vm.conf for VM NAME."
+  (with-temp-file (qvm--vm-conf name)
+    (insert (format "# qvm configuration for '%s'\n" name))
+    (insert (format "# Generated %s\n" (format-time-string "%FT%T%z")))
+    (dolist (pair conf)
+      (insert (format "%s=\"%s\"\n" (car pair) (cdr pair))))))
+
+(defun qvm--update-conf-value (name key value)
+  "Update KEY to VALUE in vm.conf for VM NAME."
+  (let ((conf-file (qvm--vm-conf name)))
+    (with-temp-buffer
+      (insert-file-contents conf-file)
+      (goto-char (point-min))
+      (if (re-search-forward (format "^%s=\".*\"" (regexp-quote key)) nil t)
+          (replace-match (format "%s=\"%s\"" key value))
+        (goto-char (point-max))
+        (unless (bolp) (insert "\n"))
+        (insert (format "%s=\"%s\"\n" key value)))
+      (write-region (point-min) (point-max) conf-file nil 'silent))))
+
+;; ── State queries ────────────────────────────────────────────────────────────
+
+(defun qvm--pid-alive-p (pid)
+  "Return non-nil if process PID is alive."
+  (= 0 (call-process "kill" nil nil nil "-0" (number-to-string pid))))
+
+(defun qvm--read-pid (name)
+  "Read and return the PID from VM NAME's pidfile, or nil."
+  (let ((pidfile (qvm--vm-pid name)))
+    (when (file-exists-p pidfile)
+      (let ((pid (string-to-number
+                  (string-trim (with-temp-buffer
+                                 (insert-file-contents pidfile)
+                                 (buffer-string))))))
+        (when (> pid 0) pid)))))
+
 (defun qvm--running-p (name)
   "Return non-nil if VM NAME is currently running."
-  (let ((pidfile (expand-file-name (concat name "/qvm.pid") qvm-base-dir)))
-    (when (file-exists-p pidfile)
-      (let* ((pid-str (string-trim (with-temp-buffer
-                                     (insert-file-contents pidfile)
-                                     (buffer-string))))
-             (pid (string-to-number pid-str)))
-        (when (> pid 0)
-          (= 0 (call-process "kill" nil nil nil "-0" (number-to-string pid))))))))
+  (when-let ((pid (qvm--read-pid name)))
+    (qvm--pid-alive-p pid)))
 
 (defun qvm--disk-size (name)
   "Return human-readable disk usage for VM NAME."
-  (let ((disk (expand-file-name (concat name "/disk.qcow2") qvm-base-dir)))
+  (let ((disk (qvm--vm-disk name)))
     (if (file-exists-p disk)
         (string-trim
          (shell-command-to-string
@@ -129,7 +238,7 @@
 
 (defun qvm--tramp-path (name &optional path)
   "Return a TRAMP path to VM NAME at remote PATH (default /home/user/).
-Uses the SSH config alias qvm-NAME if available (set up by `qvm ssh-copy-id'),
+Uses the SSH config alias qvm-NAME if available (set up by `qvm-ssh-copy-id'),
 otherwise falls back to /ssh:user@localhost#port:path."
   (let* ((conf (qvm--read-conf name))
          (user (qvm--conf-get conf "VM_USER"))
@@ -141,7 +250,7 @@ otherwise falls back to /ssh:user@localhost#port:path."
 
 (defun qvm--snapshot-tags (name)
   "Return a list of snapshot tag names for VM NAME."
-  (let ((disk (expand-file-name (concat name "/disk.qcow2") qvm-base-dir)))
+  (let ((disk (qvm--vm-disk name)))
     (when (file-exists-p disk)
       (let ((output (shell-command-to-string
                      (format "qemu-img snapshot -l %s 2>/dev/null"
@@ -152,44 +261,189 @@ otherwise falls back to /ssh:user@localhost#port:path."
               (push (match-string 1 line) tags)))
           (nreverse tags))))))
 
-;; ── Commands ──────────────────────────────────────────────────────────────────
+;; ── Port allocation ──────────────────────────────────────────────────────────
 
-(defun qvm--run-command (args &optional on-finish)
-  "Run qvm with ARGS asynchronously, showing output in `qvm-output-buffer'.
-ON-FINISH is an optional callback called with no args when the process exits."
-  (unless qvm-executable
-    (user-error "qvm executable not found in PATH"))
-  (let* ((buf (get-buffer-create qvm-output-buffer))
-         (cmd (combine-and-quote-strings (cons qvm-executable args))))
+(defun qvm--port-in-use-p (port)
+  "Return non-nil if TCP PORT is in use."
+  (with-temp-buffer
+    (call-process "ss" nil t nil "-tlnH" (format "sport = :%d" port))
+    (> (buffer-size) 0)))
+
+(defun qvm--next-free-port (start-port)
+  "Find next free TCP port starting from START-PORT."
+  (let ((port start-port))
+    (while (qvm--port-in-use-p port)
+      (setq port (1+ port)))
+    port))
+
+(defun qvm--next-free-vnc (start-display)
+  "Find next free VNC display starting from START-DISPLAY.
+VNC display N maps to TCP port 5900+N."
+  (let ((display start-display))
+    (while (qvm--port-in-use-p (+ 5900 display))
+      (setq display (1+ display)))
+    display))
+
+;; ── Process helpers ──────────────────────────────────────────────────────────
+
+(defun qvm--run-process (proc-name program args &optional on-finish)
+  "Run PROGRAM with ARGS asynchronously, showing output in `qvm-output-buffer'.
+PROC-NAME names the process.  ON-FINISH called on successful exit."
+  (let ((buf (get-buffer-create qvm-output-buffer)))
     (with-current-buffer buf
       (setq buffer-read-only nil)
       (erase-buffer)
-      (insert (format "$ qvm %s\n\n" (string-join args " ")))
+      (insert (format "$ %s %s\n\n" program (string-join args " ")))
       (setq buffer-read-only t))
     (display-buffer buf '(display-buffer-at-bottom . ((window-height . 10))))
     (make-process
-     :name "qvm"
+     :name proc-name
      :buffer buf
-     :command (cons qvm-executable args)
+     :command (cons program args)
      :filter (lambda (proc str)
-               (with-current-buffer (process-buffer proc)
-                 (let ((inhibit-read-only t))
-                   (goto-char (point-max))
-                   (insert str))))
-     :sentinel (lambda (proc event)
+               (when (buffer-live-p (process-buffer proc))
                  (with-current-buffer (process-buffer proc)
                    (let ((inhibit-read-only t))
                      (goto-char (point-max))
-                     (insert (format "\n[%s]" (string-trim event)))))
+                     (insert str)))))
+     :sentinel (lambda (proc event)
+                 (when (buffer-live-p (process-buffer proc))
+                   (with-current-buffer (process-buffer proc)
+                     (let ((inhibit-read-only t))
+                       (goto-char (point-max))
+                       (insert (format "\n[%s]" (string-trim event))))))
                  (when (and on-finish (string-match-p "finished" event))
                    (funcall on-finish))))))
+
+(defun qvm--display-output (text)
+  "Display TEXT in the qvm output buffer."
+  (let ((buf (get-buffer-create qvm-output-buffer)))
+    (with-current-buffer buf
+      (setq buffer-read-only nil)
+      (erase-buffer)
+      (insert text)
+      (setq buffer-read-only t))
+    (display-buffer buf '(display-buffer-at-bottom . ((window-height . 10))))))
+
+(defun qvm--append-output (text)
+  "Append TEXT to the qvm output buffer."
+  (when-let ((buf (get-buffer qvm-output-buffer)))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (insert text)))))
+
+;; ── QEMU helpers ─────────────────────────────────────────────────────────────
+
+(defun qvm--qemu-display-args (conf)
+  "Return QEMU display argument list based on CONF."
+  (let ((display (or (qvm--conf-get conf "VM_DISPLAY") "vnc")))
+    (if (string= display "spice")
+        (let ((port (or (qvm--conf-get conf "VM_SPICE_PORT")
+                        (number-to-string qvm-default-spice-port))))
+          (list "-spice" (format "port=%s,disable-ticketing=on" port)
+                "-device" "virtio-serial-pci"
+                "-chardev" "spicevmc,id=vdagent,name=vdagent"
+                "-device" "virtserialport,chardev=vdagent,name=com.redhat.spice.0"
+                "-display" "none"
+                "-vga" "qxl"))
+      (let ((vnc-display (or (qvm--conf-get conf "VM_VNC_DISPLAY")
+                             (number-to-string qvm-default-vnc-display))))
+        (list "-vnc" (format ":%s" vnc-display)
+              "-display" "none"
+              "-vga" "virtio")))))
+
+(defun qvm--qemu-base-args (name conf &optional offline)
+  "Build base QEMU command args for VM NAME using CONF.
+If OFFLINE is non-nil, disable networking."
+  (let* ((disk (qvm--vm-disk name))
+         (memory (or (qvm--conf-get conf "VM_MEMORY") qvm-default-memory))
+         (cpus (or (qvm--conf-get conf "VM_CPUS") qvm-default-cpus))
+         (ssh-port (or (qvm--conf-get conf "VM_SSH_PORT")
+                       (number-to-string qvm-default-ssh-port))))
+    (append
+     (list "-enable-kvm"
+           "-m" memory
+           "-smp" cpus
+           "-cpu" "host"
+           "-drive" (format "file=%s,format=qcow2" disk))
+     (if offline
+         (list "-nic" "none")
+       (list "-nic" (format "user,hostfwd=tcp::%s-:22" ssh-port)))
+     (qvm--qemu-display-args conf))))
+
+(defun qvm--start-qemu (name args &optional on-exit)
+  "Launch QEMU for VM NAME with ARGS.
+ON-EXIT is called when the QEMU process terminates.
+Returns the process object."
+  (unless (executable-find qvm-qemu-binary)
+    (user-error "QEMU binary not found: %s" qvm-qemu-binary))
+  (let* ((pidfile (qvm--vm-pid name))
+         (proc (make-process
+                :name (format "qemu-%s" name)
+                :command (cons qvm-qemu-binary args)
+                :sentinel (lambda (_proc event)
+                            (when (file-exists-p pidfile)
+                              (delete-file pidfile))
+                            (when (get-buffer "*qvm*")
+                              (qvm-list-refresh))
+                            (when (and on-exit
+                                       (string-match-p "\\(?:finished\\|exited\\)" event))
+                              (funcall on-exit))))))
+    (set-process-query-on-exit-flag proc nil)
+    (with-temp-file pidfile
+      (insert (number-to-string (process-id proc))))
+    proc))
+
+;; ── SSH helpers ──────────────────────────────────────────────────────────────
+
+(defun qvm--ssh-args (name)
+  "Return base SSH argument list for connecting to VM NAME."
+  (if (qvm--ssh-config-host-p name)
+      (list (format "qvm-%s" name))
+    (let* ((conf (qvm--read-conf name))
+           (user (qvm--conf-get conf "VM_USER"))
+           (port (qvm--conf-get conf "VM_SSH_PORT")))
+      (list "-p" port "-o" "StrictHostKeyChecking=accept-new"
+            (format "%s@localhost" user)))))
+
+(defun qvm--add-ssh-config (name user port)
+  "Add SSH config entry for VM NAME if not already present."
+  (let* ((ssh-config (expand-file-name "~/.ssh/config"))
+         (host-alias (format "qvm-%s" name)))
+    (unless (and (file-exists-p ssh-config)
+                 (with-temp-buffer
+                   (insert-file-contents ssh-config)
+                   (goto-char (point-min))
+                   (re-search-forward
+                    (format "^Host %s$" (regexp-quote host-alias)) nil t)))
+      (make-directory (expand-file-name "~/.ssh") t)
+      (with-temp-buffer
+        (insert (format "\n# qvm: %s\nHost %s\n    HostName localhost\n    Port %s\n    User %s\n    BatchMode yes\n    StrictHostKeyChecking accept-new\n    LogLevel ERROR\n"
+                        name host-alias port user))
+        (append-to-file (point-min) (point-max) ssh-config))
+      (set-file-modes ssh-config #o600)
+      (message "Added SSH config entry '%s'" host-alias))))
+
+;; ── Commands ─────────────────────────────────────────────────────────────────
 
 ;;;###autoload
 (defun qvm-start (name)
   "Start VM NAME."
   (interactive (list (completing-read "Start VM: " (qvm--list-vms) nil t)))
-  (qvm--run-command (list "start" name)
-                    (lambda () (qvm-list-refresh))))
+  (when (qvm--running-p name)
+    (user-error "VM '%s' is already running" name))
+  (let* ((conf (qvm--read-conf name))
+         (args (qvm--qemu-base-args name conf)))
+    (qvm--start-qemu name args)
+    (qvm--display-output
+     (format "Starting VM '%s'\n  Memory:  %s\n  CPUs:    %s\n  SSH:     localhost:%s\n  Display: %s\n"
+             name
+             (or (qvm--conf-get conf "VM_MEMORY") "?")
+             (or (qvm--conf-get conf "VM_CPUS") "?")
+             (or (qvm--conf-get conf "VM_SSH_PORT") "?")
+             (or (qvm--conf-get conf "VM_DISPLAY") "vnc")))
+    (qvm-list-refresh)))
 
 ;;;###autoload
 (defun qvm-stop (name)
@@ -197,15 +451,53 @@ ON-FINISH is an optional callback called with no args when the process exits."
   (interactive (list (completing-read "Stop VM: "
                                       (seq-filter #'qvm--running-p (qvm--list-vms))
                                       nil t)))
-  (qvm--run-command (list "stop" name)
-                    (lambda () (qvm-list-refresh))))
+  (let ((pid (qvm--read-pid name)))
+    (unless pid
+      (user-error "VM '%s' does not appear to be running" name))
+    (if (qvm--pid-alive-p pid)
+        (progn
+          (qvm--display-output (format "Stopping VM '%s' (PID %d)...\n" name pid))
+          (signal-process pid 15)
+          (qvm--wait-for-stop name pid 0))
+      (let ((pidfile (qvm--vm-pid name)))
+        (when (file-exists-p pidfile)
+          (delete-file pidfile)))
+      (message "Removed stale PID file for '%s'" name)
+      (qvm-list-refresh))))
+
+(defun qvm--wait-for-stop (name pid attempts)
+  "Poll for PID to die after stopping VM NAME.
+Force-kill after 10 ATTEMPTS."
+  (cond
+   ((not (qvm--pid-alive-p pid))
+    (let ((pidfile (qvm--vm-pid name)))
+      (when (file-exists-p pidfile)
+        (delete-file pidfile)))
+    (qvm--append-output "Stopped.\n")
+    (qvm-list-refresh))
+   ((>= attempts 10)
+    (signal-process pid 9)
+    (let ((pidfile (qvm--vm-pid name)))
+      (when (file-exists-p pidfile)
+        (delete-file pidfile)))
+    (qvm--append-output "Force stopped.\n")
+    (qvm-list-refresh))
+   (t
+    (run-with-timer 1 nil #'qvm--wait-for-stop name pid (1+ attempts)))))
 
 ;;;###autoload
 (defun qvm-run (name)
-  "Start VM NAME and open VNC viewer."
+  "Start VM NAME and open the display viewer."
   (interactive (list (completing-read "Run VM: " (qvm--list-vms) nil t)))
-  (qvm--run-command (list "run" name)
-                    (lambda () (qvm-list-refresh))))
+  (let* ((conf (qvm--read-conf name))
+         (display (or (qvm--conf-get conf "VM_DISPLAY") "vnc")))
+    (unless (qvm--running-p name)
+      (qvm-start name))
+    (run-with-timer 1 nil
+                    (lambda ()
+                      (if (string= display "spice")
+                          (qvm-spice name)
+                        (qvm-vnc name))))))
 
 ;;;###autoload
 (defun qvm-vnc (name)
@@ -213,7 +505,14 @@ ON-FINISH is an optional callback called with no args when the process exits."
   (interactive (list (completing-read "VNC to VM: "
                                       (seq-filter #'qvm--running-p (qvm--list-vms))
                                       nil t)))
-  (qvm--run-command (list "vnc" name)))
+  (unless (qvm--running-p name)
+    (user-error "VM '%s' is not running" name))
+  (let* ((conf (qvm--read-conf name))
+         (vnc-display (qvm--conf-get conf "VM_VNC_DISPLAY"))
+         (vnc-port (+ 5900 (string-to-number (or vnc-display "1")))))
+    (qvm--run-process "qvm-vnc" qvm-vnc-viewer
+                      (append (list (format "localhost:%d" vnc-port))
+                              qvm-vnc-viewer-args))))
 
 ;;;###autoload
 (defun qvm-spice (name)
@@ -221,17 +520,26 @@ ON-FINISH is an optional callback called with no args when the process exits."
   (interactive (list (completing-read "SPICE to VM: "
                                       (seq-filter #'qvm--running-p (qvm--list-vms))
                                       nil t)))
-  (qvm--run-command (list "spice" name)))
+  (unless (qvm--running-p name)
+    (user-error "VM '%s' is not running" name))
+  (let* ((conf (qvm--read-conf name))
+         (spice-port (or (qvm--conf-get conf "VM_SPICE_PORT")
+                         (number-to-string qvm-default-spice-port))))
+    (qvm--run-process "qvm-spice" qvm-spice-viewer
+                      (list "-h" "localhost" "-p" spice-port))))
 
 ;;;###autoload
 (defun qvm-display (name)
   "Toggle display type between vnc and spice for VM NAME."
   (interactive (list (completing-read "Toggle display for VM: " (qvm--list-vms) nil t)))
+  (when (qvm--running-p name)
+    (user-error "VM '%s' is running -- stop it first to switch display" name))
   (let* ((conf (qvm--read-conf name))
          (current (or (qvm--conf-get conf "VM_DISPLAY") "vnc"))
          (new (if (string= current "vnc") "spice" "vnc")))
-    (qvm--run-command (list "display" name new)
-                      (lambda () (qvm-list-refresh)))))
+    (qvm--update-conf-value name "VM_DISPLAY" new)
+    (message "Switched '%s' to %s (takes effect on next start)" name new)
+    (qvm-list-refresh)))
 
 ;;;###autoload
 (defun qvm-keyboard (name)
@@ -239,7 +547,16 @@ ON-FINISH is an optional callback called with no args when the process exits."
   (interactive (list (completing-read "Keyboard setup for VM: "
                                       (seq-filter #'qvm--running-p (qvm--list-vms))
                                       nil t)))
-  (qvm--run-command (list "keyboard" name)))
+  (unless (qvm--running-p name)
+    (user-error "VM '%s' is not running" name))
+  (let ((ssh-args (qvm--ssh-args name))
+        (remote-cmd (string-join
+                     '("gsettings set org.gnome.desktop.input-sources sources \"[('xkb', 'gb')]\""
+                       "gsettings set org.gnome.desktop.input-sources xkb-options \"['ctrl:nocaps','ctrl:ralt_rctrl']\""
+                       "gsettings set org.gnome.desktop.a11y.keyboard stickykeys-enable true")
+                     " && ")))
+    (qvm--run-process "qvm-keyboard" "ssh"
+                      (append ssh-args (list remote-cmd)))))
 
 ;;;###autoload
 (defun qvm-clip-copy (name)
@@ -247,7 +564,25 @@ ON-FINISH is an optional callback called with no args when the process exits."
   (interactive (list (completing-read "Copy clipboard from VM: "
                                       (seq-filter #'qvm--running-p (qvm--list-vms))
                                       nil t)))
-  (qvm--run-command (list "clip" name "copy")))
+  (unless (qvm--running-p name)
+    (user-error "VM '%s' is not running" name))
+  (let* ((ssh-args (qvm--ssh-args name))
+         (remote-cmd (concat
+                      "if command -v wl-paste >/dev/null 2>&1; then wl-paste;"
+                      " elif command -v xclip >/dev/null 2>&1; then xclip -selection clipboard -o;"
+                      " elif command -v xsel >/dev/null 2>&1; then xsel --clipboard --output;"
+                      " else echo 'No clipboard tool found' >&2; exit 1; fi"))
+         (content (with-temp-buffer
+                    (let ((exit-code (apply #'call-process "ssh" nil t nil
+                                           (append ssh-args (list remote-cmd)))))
+                      (unless (= exit-code 0)
+                        (user-error "Failed to read VM clipboard"))
+                      (buffer-string)))))
+    (kill-new content)
+    (with-temp-buffer
+      (insert content)
+      (call-process-region (point-min) (point-max) "wl-copy"))
+    (message "Copied VM clipboard -> host (%d chars)" (length content))))
 
 ;;;###autoload
 (defun qvm-clip-paste (name)
@@ -255,7 +590,22 @@ ON-FINISH is an optional callback called with no args when the process exits."
   (interactive (list (completing-read "Paste clipboard to VM: "
                                       (seq-filter #'qvm--running-p (qvm--list-vms))
                                       nil t)))
-  (qvm--run-command (list "clip" name "paste")))
+  (unless (qvm--running-p name)
+    (user-error "VM '%s' is not running" name))
+  (let* ((ssh-args (qvm--ssh-args name))
+         (content (with-temp-buffer
+                    (call-process "wl-paste" nil t nil)
+                    (buffer-string)))
+         (remote-cmd (concat
+                      "if command -v wl-copy >/dev/null 2>&1; then wl-copy;"
+                      " elif command -v xclip >/dev/null 2>&1; then xclip -selection clipboard;"
+                      " elif command -v xsel >/dev/null 2>&1; then xsel --clipboard --input;"
+                      " else echo 'No clipboard tool found' >&2; exit 1; fi")))
+    (with-temp-buffer
+      (insert content)
+      (apply #'call-process-region (point-min) (point-max) "ssh" nil nil nil
+             (append ssh-args (list remote-cmd))))
+    (message "Pasted host clipboard -> VM (%d chars)" (length content))))
 
 ;;;###autoload
 (defun qvm-ssh-copy-id (name)
@@ -266,12 +616,46 @@ Runs in a terminal buffer since it may prompt for a password."
                                       nil t)))
   (unless (qvm--running-p name)
     (user-error "VM '%s' is not running" name))
-  (let ((buf-name (format "*qvm ssh-copy-id: %s*" name)))
+  (let* ((conf (qvm--read-conf name))
+         (user (qvm--conf-get conf "VM_USER"))
+         (port (qvm--conf-get conf "VM_SSH_PORT"))
+         (buf-name (format "*qvm ssh-copy-id: %s*" name)))
     (when (get-buffer buf-name)
       (kill-buffer buf-name))
-    (let ((buf (make-term buf-name qvm-executable nil "ssh-copy-id" name)))
+    (let* ((buf (make-term buf-name "ssh-copy-id" nil
+                           "-p" port
+                           "-o" "StrictHostKeyChecking=accept-new"
+                           (format "%s@localhost" user)))
+           (proc (get-buffer-process buf)))
       (with-current-buffer buf (term-mode) (term-char-mode))
+      (when proc
+        (set-process-sentinel
+         proc
+         (lambda (_proc event)
+           (when (string-match-p "finished" event)
+             (qvm--ssh-post-copy-id name)))))
       (pop-to-buffer buf))))
+
+(defun qvm--ssh-post-copy-id (name)
+  "Fix permissions and add SSH config after ssh-copy-id for VM NAME."
+  (let* ((conf (qvm--read-conf name))
+         (user (qvm--conf-get conf "VM_USER"))
+         (port (qvm--conf-get conf "VM_SSH_PORT")))
+    (call-process "ssh" nil nil nil
+                  "-p" port
+                  "-o" "StrictHostKeyChecking=accept-new"
+                  (format "%s@localhost" user)
+                  "chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys")
+    (if (= 0 (call-process "ssh" nil nil nil
+                            "-p" port
+                            "-o" "StrictHostKeyChecking=accept-new"
+                            "-o" "BatchMode=yes"
+                            (format "%s@localhost" user)
+                            "true"))
+        (progn
+          (qvm--add-ssh-config name user port)
+          (message "SSH key auth verified for '%s'" name))
+      (message "Key auth verification failed for '%s'" name))))
 
 ;;;###autoload
 (defun qvm-dired (name)
@@ -290,10 +674,7 @@ Runs in a terminal buffer since it may prompt for a password."
                                       (seq-filter #'qvm--running-p (qvm--list-vms))
                                       nil t)))
   (if (qvm--running-p name)
-      (let* ((conf (qvm--read-conf name))
-             (user (qvm--conf-get conf "VM_USER"))
-             (port (qvm--conf-get conf "VM_SSH_PORT"))
-             (default-directory (qvm--tramp-path name))
+      (let* ((default-directory (qvm--tramp-path name))
              (buf-name (format "*eshell: %s*" name)))
         (if (get-buffer buf-name)
             (pop-to-buffer buf-name)
@@ -367,14 +748,16 @@ Otherwise, prompts for a file."
           (tag (read-string "Snapshot tag: ")))
      (list name tag)))
   (when (qvm--running-p name)
-    (user-error "VM '%s' is running — stop it first" name))
-  (qvm--run-command (list "snapshot" name "create" tag)))
+    (user-error "VM '%s' is running -- stop it first" name))
+  (qvm--run-process "qvm-snapshot" "qemu-img"
+                    (list "snapshot" "-c" tag (qvm--vm-disk name))))
 
 ;;;###autoload
 (defun qvm-snapshot-list (name)
   "List snapshots for VM NAME."
   (interactive (list (completing-read "List snapshots for VM: " (qvm--list-vms) nil t)))
-  (qvm--run-command (list "snapshot" name "list")))
+  (qvm--run-process "qvm-snapshot" "qemu-img"
+                    (list "snapshot" "-l" (qvm--vm-disk name))))
 
 ;;;###autoload
 (defun qvm-snapshot-restore (name tag)
@@ -386,9 +769,10 @@ Otherwise, prompts for a file."
           (tag (completing-read "Snapshot to restore: " tags nil t)))
      (list name tag)))
   (when (qvm--running-p name)
-    (user-error "VM '%s' is running — stop it first" name))
+    (user-error "VM '%s' is running -- stop it first" name))
   (when (yes-or-no-p (format "Restore snapshot '%s' for VM '%s'? " tag name))
-    (qvm--run-command (list "snapshot" name "restore" tag))))
+    (qvm--run-process "qvm-snapshot" "qemu-img"
+                      (list "snapshot" "-a" tag (qvm--vm-disk name)))))
 
 ;;;###autoload
 (defun qvm-snapshot-delete (name tag)
@@ -400,9 +784,10 @@ Otherwise, prompts for a file."
           (tag (completing-read "Snapshot to delete: " tags nil t)))
      (list name tag)))
   (when (qvm--running-p name)
-    (user-error "VM '%s' is running — stop it first" name))
+    (user-error "VM '%s' is running -- stop it first" name))
   (when (yes-or-no-p (format "Delete snapshot '%s' from VM '%s'? " tag name))
-    (qvm--run-command (list "snapshot" name "delete" tag))))
+    (qvm--run-process "qvm-snapshot" "qemu-img"
+                      (list "snapshot" "-d" tag (qvm--vm-disk name)))))
 
 ;;;###autoload
 (defun qvm-clone (name new-name linked)
@@ -414,19 +799,74 @@ With prefix argument or LINKED non-nil, create a linked (COW) clone."
           (linked (yes-or-no-p "Create linked (COW) clone? ")))
      (list name new-name linked)))
   (when (qvm--running-p name)
-    (user-error "VM '%s' is running — stop it first" name))
+    (user-error "VM '%s' is running -- stop it first" name))
   (when (string-empty-p new-name)
     (user-error "New VM name cannot be empty"))
-  (qvm--run-command (if linked
-                        (list "clone" name new-name "--linked")
-                      (list "clone" name new-name))
-                    (lambda () (qvm-list-refresh))))
+  (when (file-exists-p (qvm--vm-conf new-name))
+    (user-error "VM '%s' already exists" new-name))
+  (let* ((conf (qvm--read-conf name))
+         (ssh-port (qvm--next-free-port qvm-default-ssh-port))
+         (vnc-display (qvm--next-free-vnc qvm-default-vnc-display))
+         (spice-port (qvm--next-free-port qvm-default-spice-port))
+         (new-conf (list (cons "VM_MEMORY" (or (qvm--conf-get conf "VM_MEMORY") qvm-default-memory))
+                         (cons "VM_CPUS" (or (qvm--conf-get conf "VM_CPUS") qvm-default-cpus))
+                         (cons "VM_DISK_SIZE" (or (qvm--conf-get conf "VM_DISK_SIZE") qvm-default-disk))
+                         (cons "VM_SSH_PORT" (number-to-string ssh-port))
+                         (cons "VM_VNC_DISPLAY" (number-to-string vnc-display))
+                         (cons "VM_SPICE_PORT" (number-to-string spice-port))
+                         (cons "VM_DISPLAY" (or (qvm--conf-get conf "VM_DISPLAY") qvm-default-display))
+                         (cons "VM_USER" (or (qvm--conf-get conf "VM_USER") qvm-default-user)))))
+    (make-directory (qvm--vm-dir new-name) t)
+    (if linked
+        (let ((src-disk (file-truename (qvm--vm-disk name))))
+          (qvm--run-process
+           "qvm-clone" "qemu-img"
+           (list "create" "-f" "qcow2" "-b" src-disk "-F" "qcow2"
+                 (qvm--vm-disk new-name))
+           (lambda ()
+             (qvm--write-conf new-name new-conf)
+             (qvm-list-refresh))))
+      (qvm--run-process
+       "qvm-clone" "cp"
+       (list (qvm--vm-disk name) (qvm--vm-disk new-name))
+       (lambda ()
+         (qvm--write-conf new-name new-conf)
+         (qvm-list-refresh))))))
 
 ;;;###autoload
 (defun qvm-info (name)
   "Show info for VM NAME."
   (interactive (list (completing-read "VM info: " (qvm--list-vms) nil t)))
-  (qvm--run-command (list "info" name)))
+  (let* ((conf (qvm--read-conf name))
+         (running (qvm--running-p name))
+         (memory (or (qvm--conf-get conf "VM_MEMORY") "?"))
+         (cpus (or (qvm--conf-get conf "VM_CPUS") "?"))
+         (disk-max (or (qvm--conf-get conf "VM_DISK_SIZE") "?"))
+         (disk-used (qvm--disk-size name))
+         (display (or (qvm--conf-get conf "VM_DISPLAY") "vnc"))
+         (ssh-port (or (qvm--conf-get conf "VM_SSH_PORT") "?"))
+         (user (or (qvm--conf-get conf "VM_USER") "?"))
+         (vnc-display (qvm--conf-get conf "VM_VNC_DISPLAY"))
+         (spice-port (qvm--conf-get conf "VM_SPICE_PORT")))
+    (qvm--display-output
+     (concat
+      (format "%s\n" name)
+      (format "  Status:    %s\n" (if running "running" "stopped"))
+      (format "  Directory: %s\n" (qvm--vm-dir name))
+      (format "  Disk:      %s (%s used / %s max)\n"
+              (qvm--vm-disk name) disk-used disk-max)
+      (format "  Memory:    %s\n" memory)
+      (format "  CPUs:      %s\n" cpus)
+      (format "  Display:   %s\n" display)
+      (format "  SSH port:  %s\n" ssh-port)
+      (if (string= display "spice")
+          (format "  SPICE:     localhost:%s\n" (or spice-port "?"))
+        (format "  VNC:       :%s (port %d)\n"
+                (or vnc-display "?")
+                (+ 5900 (string-to-number (or vnc-display "0")))))
+      (format "  User:      %s\n" user)
+      "\n"
+      (format "  TRAMP:     %s\n" (qvm--tramp-path name))))))
 
 ;;;###autoload
 (defun qvm-create (name iso disk memory cpus)
@@ -443,18 +883,65 @@ via `read-file-name'.  DISK, MEMORY, and CPUS are prompted with defaults."
                                    (or (file-directory-p f)
                                        (string-match-p "\\.iso\\'" f))))))
           (name   (read-string "VM name: "))
-          (disk   (read-string "Disk size: " "40G"))
-          (memory (read-string "Memory: " "4G"))
-          (cpus   (read-string "CPUs: " "4")))
+          (disk   (read-string "Disk size: " qvm-default-disk))
+          (memory (read-string "Memory: " qvm-default-memory))
+          (cpus   (read-string "CPUs: " qvm-default-cpus)))
      (list name iso disk memory cpus)))
-  (qvm--run-command
-   (list "create" name "--disk" disk "--memory" memory "--cpus" cpus)
-   (lambda ()
-     (qvm--run-command
-      (list "install" name "--iso" (expand-file-name iso))
-      (lambda () (qvm-list-refresh))))))
+  (when (file-exists-p (qvm--vm-conf name))
+    (user-error "VM '%s' already exists" name))
+  (let* ((ssh-port (qvm--next-free-port qvm-default-ssh-port))
+         (vnc-display (qvm--next-free-vnc qvm-default-vnc-display))
+         (spice-port (qvm--next-free-port qvm-default-spice-port))
+         (conf (list (cons "VM_MEMORY" memory)
+                     (cons "VM_CPUS" cpus)
+                     (cons "VM_DISK_SIZE" disk)
+                     (cons "VM_SSH_PORT" (number-to-string ssh-port))
+                     (cons "VM_VNC_DISPLAY" (number-to-string vnc-display))
+                     (cons "VM_SPICE_PORT" (number-to-string spice-port))
+                     (cons "VM_DISPLAY" qvm-default-display)
+                     (cons "VM_USER" qvm-default-user)))
+         (expanded-iso (expand-file-name iso)))
+    (make-directory (qvm--vm-dir name) t)
+    (qvm--run-process
+     "qvm-create" "qemu-img"
+     (list "create" "-f" "qcow2" (qvm--vm-disk name) disk)
+     (lambda ()
+       (qvm--write-conf name conf)
+       (let ((args (append (qvm--qemu-base-args name conf)
+                           (list "-cdrom" expanded-iso "-boot" "d"))))
+         (qvm--start-qemu name args (lambda () (qvm-list-refresh)))
+         (qvm--append-output
+          (format "\nInstalling from %s...\nQEMU running. After installation, stop the VM.\n"
+                  (file-name-nondirectory expanded-iso)))
+         (qvm-list-refresh))))))
 
-;; ── List buffer ───────────────────────────────────────────────────────────────
+;; ── Clip install (needs terminal for sudo) ───────────────────────────────────
+
+(defun qvm--clip-install (name)
+  "Install clipboard tools on VM NAME in a terminal buffer."
+  (let* ((conf (qvm--read-conf name))
+         (user (qvm--conf-get conf "VM_USER"))
+         (port (qvm--conf-get conf "VM_SSH_PORT"))
+         (buf-name (format "*qvm clip install: %s*" name))
+         (remote-cmd (concat
+                      "sudo pkill -9 PackageKit 2>/dev/null; sleep 1; "
+                      "if command -v zypper >/dev/null 2>&1; then sudo zypper install -y wl-clipboard xclip; "
+                      "elif command -v apt-get >/dev/null 2>&1; then sudo apt-get install -y wl-clipboard xclip; "
+                      "elif command -v dnf >/dev/null 2>&1; then sudo dnf install -y wl-clipboard xclip; "
+                      "elif command -v pacman >/dev/null 2>&1; then sudo pacman -S --noconfirm wl-clipboard xclip; "
+                      "elif command -v apk >/dev/null 2>&1; then sudo apk add wl-clipboard xclip; "
+                      "else echo 'Error: no supported package manager found' >&2; exit 1; fi")))
+    (when (get-buffer buf-name)
+      (kill-buffer buf-name))
+    (let ((buf (make-term buf-name "ssh" nil
+                          "-t" "-p" port
+                          "-o" "StrictHostKeyChecking=accept-new"
+                          (format "%s@localhost" user)
+                          remote-cmd)))
+      (with-current-buffer buf (term-mode) (term-char-mode))
+      (pop-to-buffer buf))))
+
+;; ── List buffer ──────────────────────────────────────────────────────────────
 
 (defvar qvm-list-mode-map
   (let ((map (make-sparse-keymap)))
@@ -547,7 +1034,7 @@ via `read-file-name'.  DISK, MEMORY, and CPUS are prompted with defaults."
       (user-error "Move point to a VM row first (use n/p or arrow keys)")))
 
 (defun qvm-list-run ()
-  "Run the VM at point (start + VNC)."
+  "Run the VM at point (start + viewer)."
   (interactive)
   (qvm-run (qvm-list--current-name)))
 
@@ -613,12 +1100,7 @@ via `read-file-name'.  DISK, MEMORY, and CPUS are prompted with defaults."
   (interactive)
   (let ((name (qvm-list--current-name)))
     (when (yes-or-no-p (format "Install xclip on '%s'? " name))
-      (let ((buf-name (format "*qvm clip install: %s*" name)))
-        (when (get-buffer buf-name)
-          (kill-buffer buf-name))
-        (let ((buf (make-term buf-name qvm-executable nil "clip" name "install")))
-          (with-current-buffer buf (term-mode) (term-char-mode))
-          (pop-to-buffer buf))))))
+      (qvm--clip-install name))))
 
 (defun qvm-list-ssh-copy-id ()
   "Push SSH public key to the VM at point."
