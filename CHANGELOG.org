@@ -3,6 +3,13 @@
 
 * 1.1.0 — <2026-04-13>
 
+** Added
+
+- Virtiofs shared folders: set ~SHARE_PATH~ / ~SHARE_TAG~ on a VM (via ~qemu-manager-share-set~ or ~F~ in the list buffer) and ~qemu-manager-start~ launches ~virtiofsd~ alongside QEMU on a per-VM Unix socket, wires up ~memory-backend-memfd~ + ~vhost-user-fs-pci~ args, and tears the daemon down when the VM exits
+- ~qemu-manager-virtiofsd-binary~ and ~qemu-manager-virtiofsd-args~ customizations
+- ~qemu-manager-share-set~ interactive command and ~qemu-manager-list-share-set~ (~F~) list-buffer wrapper; share entry added to the Tools group in the transient menu
+- ~qemu-manager-info~ now reports the configured share path and mount tag
+
 ** Fixed
 
 - ~qemu-manager-eshell~ no longer errors with "Defining as dynamic an already lexical var: eshell-buffer-name" on recent Emacs; the eshell buffer is now created via ~(eshell t)~ and renamed after the fact

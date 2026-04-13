@@ -33,6 +33,7 @@
 ;;   e        -- open eshell via TRAMP
 ;;   S        -- rsync files to VM
 ;;   P        -- push SSH key to VM (passwordless access)
+;;   F        -- configure virtiofs shared folder
 ;;   C        -- clone VM
 ;;   +        -- create snapshot
 ;;   N        -- list snapshots
@@ -85,6 +86,26 @@
 (defcustom qemu-manager-spice-viewer (or (executable-find "spicy") "spicy")
   "Path to the SPICE viewer program."
   :type 'file
+  :group 'qemu-manager)
+
+(defcustom qemu-manager-virtiofsd-binary
+  (or (executable-find "virtiofsd")
+      (seq-find #'file-executable-p
+                '("/usr/lib/virtiofsd"
+                  "/usr/libexec/virtiofsd"
+                  "/usr/lib/qemu/virtiofsd"))
+      "virtiofsd")
+  "Path to the virtiofsd daemon used for shared folders."
+  :type 'file
+  :group 'qemu-manager)
+
+(defcustom qemu-manager-virtiofsd-args '("--cache=auto" "--sandbox=none")
+  "Extra arguments passed to virtiofsd.
+These are appended after --socket-path and --shared-dir.
+\"--sandbox=none\" is included by default because the namespace
+sandbox requires CAP_SYS_ADMIN and fails when run as a regular
+user; remove it if you are running virtiofsd as root."
+  :type '(repeat string)
   :group 'qemu-manager)
 
 (defcustom qemu-manager-default-memory "4G"
@@ -149,6 +170,14 @@
 (defun qemu-manager--vm-pid (name)
   "Return the PID file path for VM NAME."
   (expand-file-name "qemu-manager.pid" (qemu-manager--vm-dir name)))
+
+(defun qemu-manager--virtiofs-sock (name)
+  "Return the virtiofs socket path for VM NAME."
+  (expand-file-name "virtiofs.sock" (qemu-manager--vm-dir name)))
+
+(defun qemu-manager--virtiofsd-pid-file (name)
+  "Return the virtiofsd PID file path for VM NAME."
+  (expand-file-name "virtiofsd.pid" (qemu-manager--vm-dir name)))
 
 ;; ── Config parsing ───────────────────────────────────────────────────────────
 
@@ -353,6 +382,21 @@ PROC-NAME names the process.  ON-FINISH called on successful exit."
               "-display" "none"
               "-vga" "virtio")))))
 
+(defun qemu-manager--qemu-share-args (name conf memory)
+  "Return QEMU args that wire up a virtiofs share for VM NAME.
+CONF is the parsed config alist; MEMORY is the -m size string
+(reused verbatim for the shared memory backend). Returns nil if
+no share is configured."
+  (let ((share-path (qemu-manager--conf-get conf "SHARE_PATH")))
+    (when (and share-path (not (string-empty-p share-path)))
+      (let ((tag (or (qemu-manager--conf-get conf "SHARE_TAG") "hostshare"))
+            (sock (qemu-manager--virtiofs-sock name)))
+        (list "-object" (format "memory-backend-memfd,id=mem,size=%s,share=on" memory)
+              "-numa" "node,memdev=mem"
+              "-chardev" (format "socket,id=char-virtiofs,path=%s" sock)
+              "-device" (format "vhost-user-fs-pci,queue-size=1024,chardev=char-virtiofs,tag=%s"
+                                tag))))))
+
 (defun qemu-manager--qemu-base-args (name conf &optional offline)
   "Build base QEMU command args for VM NAME using CONF.
 If OFFLINE is non-nil, disable networking."
@@ -370,7 +414,61 @@ If OFFLINE is non-nil, disable networking."
      (if offline
          (list "-nic" "none")
        (list "-nic" (format "user,hostfwd=tcp::%s-:22" ssh-port)))
+     (qemu-manager--qemu-share-args name conf memory)
      (qemu-manager--qemu-display-args conf))))
+
+(defun qemu-manager--start-virtiofsd (name share-path)
+  "Launch virtiofsd sharing SHARE-PATH for VM NAME.
+Blocks briefly until the socket appears."
+  (unless (file-directory-p share-path)
+    (user-error "Share path does not exist: %s" share-path))
+  (unless (or (file-executable-p qemu-manager-virtiofsd-binary)
+              (executable-find qemu-manager-virtiofsd-binary))
+    (user-error "virtiofsd binary not found: %s" qemu-manager-virtiofsd-binary))
+  (let* ((sock (qemu-manager--virtiofs-sock name))
+         (pidfile (qemu-manager--virtiofsd-pid-file name))
+         (buf (get-buffer-create (format "*virtiofsd: %s*" name)))
+         (args (append (list (format "--socket-path=%s" sock)
+                             (format "--shared-dir=%s" (expand-file-name share-path)))
+                       qemu-manager-virtiofsd-args)))
+    (when (file-exists-p sock) (delete-file sock))
+    (with-current-buffer buf (erase-buffer))
+    (let ((proc (make-process
+                 :name (format "virtiofsd-%s" name)
+                 :buffer buf
+                 :command (cons qemu-manager-virtiofsd-binary args)
+                 :sentinel (lambda (_p _e)
+                             (when (file-exists-p pidfile)
+                               (delete-file pidfile))
+                             (when (file-exists-p sock)
+                               (delete-file sock))))))
+      (set-process-query-on-exit-flag proc nil)
+      (with-temp-file pidfile
+        (insert (number-to-string (process-id proc))))
+      (let ((tries 0))
+        (while (and (< tries 30)
+                    (process-live-p proc)
+                    (not (file-exists-p sock)))
+          (sit-for 0.1)
+          (setq tries (1+ tries))))
+      (unless (and (process-live-p proc) (file-exists-p sock))
+        (user-error "virtiofsd failed to start; see buffer %s" (buffer-name buf)))
+      proc)))
+
+(defun qemu-manager--stop-virtiofsd (name)
+  "Terminate the virtiofsd process for VM NAME if running."
+  (let ((pidfile (qemu-manager--virtiofsd-pid-file name))
+        (sock (qemu-manager--virtiofs-sock name)))
+    (when (file-exists-p pidfile)
+      (let ((pid (string-to-number
+                  (string-trim (with-temp-buffer
+                                 (insert-file-contents pidfile)
+                                 (buffer-string))))))
+        (when (and (> pid 0) (qemu-manager--pid-alive-p pid))
+          (ignore-errors (signal-process pid 15))))
+      (delete-file pidfile))
+    (when (file-exists-p sock)
+      (ignore-errors (delete-file sock)))))
 
 (defun qemu-manager--start-qemu (name args &optional on-exit)
   "Launch QEMU for VM NAME with ARGS.
@@ -385,6 +483,7 @@ Returns the process object."
                 :sentinel (lambda (_proc event)
                             (when (file-exists-p pidfile)
                               (delete-file pidfile))
+                            (qemu-manager--stop-virtiofsd name)
                             (when (get-buffer "*qemu-manager*")
                               (qemu-manager-list-refresh))
                             (when (and on-exit
@@ -434,15 +533,23 @@ Returns the process object."
   (when (qemu-manager--running-p name)
     (user-error "VM '%s' is already running" name))
   (let* ((conf (qemu-manager--read-conf name))
+         (share-path (qemu-manager--conf-get conf "SHARE_PATH"))
          (args (qemu-manager--qemu-base-args name conf)))
+    (when (and share-path (not (string-empty-p share-path)))
+      (qemu-manager--start-virtiofsd name share-path))
     (qemu-manager--start-qemu name args)
     (qemu-manager--display-output
-     (format "Starting VM '%s'\n  Memory:  %s\n  CPUs:    %s\n  SSH:     localhost:%s\n  Display: %s\n"
+     (format "Starting VM '%s'\n  Memory:  %s\n  CPUs:    %s\n  SSH:     localhost:%s\n  Display: %s\n%s"
              name
              (or (qemu-manager--conf-get conf "VM_MEMORY") "?")
              (or (qemu-manager--conf-get conf "VM_CPUS") "?")
              (or (qemu-manager--conf-get conf "VM_SSH_PORT") "?")
-             (or (qemu-manager--conf-get conf "VM_DISPLAY") "vnc")))
+             (or (qemu-manager--conf-get conf "VM_DISPLAY") "vnc")
+             (if (and share-path (not (string-empty-p share-path)))
+                 (format "  Share:   %s (tag %s)\n"
+                         share-path
+                         (or (qemu-manager--conf-get conf "SHARE_TAG") "hostshare"))
+               "")))
     (qemu-manager-list-refresh)))
 
 ;;;###autoload
@@ -540,6 +647,40 @@ Force-kill after 10 ATTEMPTS."
     (qemu-manager--update-conf-value name "VM_DISPLAY" new)
     (message "Switched '%s' to %s (takes effect on next start)" name new)
     (qemu-manager-list-refresh)))
+
+;;;###autoload
+(defun qemu-manager-share-set (name path tag)
+  "Configure a virtiofs shared folder for VM NAME.
+PATH is the host directory to share; an empty string clears the
+share. TAG is the mount tag the guest will use with
+`mount -t virtiofs'. Changes take effect on the next start."
+  (interactive
+   (let* ((name (completing-read "Configure share for VM: "
+                                 (qemu-manager--list-vms) nil t))
+          (conf (qemu-manager--read-conf name))
+          (current-path (or (qemu-manager--conf-get conf "SHARE_PATH") ""))
+          (current-tag (or (qemu-manager--conf-get conf "SHARE_TAG") "hostshare"))
+          (path (read-string "Host path to share (empty to disable): "
+                             current-path))
+          (tag (if (string-empty-p path) ""
+                 (read-string "Mount tag: " current-tag))))
+     (list name path tag)))
+  (when (qemu-manager--running-p name)
+    (user-error "VM '%s' is running -- stop it first to change the share" name))
+  (cond
+   ((string-empty-p path)
+    (qemu-manager--update-conf-value name "SHARE_PATH" "")
+    (qemu-manager--update-conf-value name "SHARE_TAG" "")
+    (message "Cleared virtiofs share for '%s'" name))
+   (t
+    (let ((expanded (expand-file-name path)))
+      (unless (file-directory-p expanded)
+        (user-error "Not a directory: %s" expanded))
+      (qemu-manager--update-conf-value name "SHARE_PATH" expanded)
+      (qemu-manager--update-conf-value name "SHARE_TAG" tag)
+      (message "Share for '%s': %s (tag %s). Mount in guest: mount -t virtiofs %s /mnt"
+               name expanded tag tag))))
+  (qemu-manager-list-refresh))
 
 ;;;###autoload
 (defun qemu-manager-keyboard (name)
@@ -668,14 +809,24 @@ Runs in a terminal buffer since it may prompt for a password."
     (user-error "VM '%s' is not running" name)))
 
 ;;;###autoload
-(defun qemu-manager-eshell (name)
-  "Open an eshell on VM NAME via TRAMP."
-  (interactive (list (completing-read "Shell into VM: "
-                                      (seq-filter #'qemu-manager--running-p (qemu-manager--list-vms))
-                                      nil t)))
+(defun qemu-manager-eshell (name &optional path)
+  "Open an eshell on VM NAME via TRAMP.
+With prefix arg, prompt for PATH -- an absolute remote path to
+start in (e.g. /mnt). This creates a buffer distinct from the
+default per-VM eshell so the TRAMP-qualified starting directory
+is preserved."
+  (interactive
+   (let ((name (completing-read "Shell into VM: "
+                                (seq-filter #'qemu-manager--running-p (qemu-manager--list-vms))
+                                nil t)))
+     (list name
+           (when current-prefix-arg
+             (read-string "Remote start path: " "/")))))
   (if (qemu-manager--running-p name)
-      (let* ((default-directory (qemu-manager--tramp-path name))
-             (buf-name (format "*eshell: %s*" name)))
+      (let* ((default-directory (qemu-manager--tramp-path name path))
+             (buf-name (if path
+                           (format "*eshell: %s @ %s*" name path)
+                         (format "*eshell: %s*" name))))
         (if (get-buffer buf-name)
             (pop-to-buffer buf-name)
           (with-current-buffer (eshell t)
@@ -848,7 +999,9 @@ With prefix argument or LINKED non-nil, create a linked (COW) clone."
          (ssh-port (or (qemu-manager--conf-get conf "VM_SSH_PORT") "?"))
          (user (or (qemu-manager--conf-get conf "VM_USER") "?"))
          (vnc-display (qemu-manager--conf-get conf "VM_VNC_DISPLAY"))
-         (spice-port (qemu-manager--conf-get conf "VM_SPICE_PORT")))
+         (spice-port (qemu-manager--conf-get conf "VM_SPICE_PORT"))
+         (share-path (qemu-manager--conf-get conf "SHARE_PATH"))
+         (share-tag (or (qemu-manager--conf-get conf "SHARE_TAG") "hostshare")))
     (qemu-manager--display-output
      (concat
       (format "%s\n" name)
@@ -866,6 +1019,9 @@ With prefix argument or LINKED non-nil, create a linked (COW) clone."
                 (or vnc-display "?")
                 (+ 5900 (string-to-number (or vnc-display "0")))))
       (format "  User:      %s\n" user)
+      (if (and share-path (not (string-empty-p share-path)))
+          (format "  Share:     %s (tag %s)\n" share-path share-tag)
+        "")
       "\n"
       (format "  TRAMP:     %s\n" (qemu-manager--tramp-path name))))))
 
@@ -963,6 +1119,7 @@ via `read-file-name'.  DISK, MEMORY, and CPUS are prompted with defaults."
     (define-key map (kbd "I")   #'qemu-manager-list-clip-install)
     (define-key map (kbd "S")   #'qemu-manager-list-scp)
     (define-key map (kbd "P")   #'qemu-manager-list-ssh-copy-id)
+    (define-key map (kbd "F")   #'qemu-manager-list-share-set)
     (define-key map (kbd "C")   #'qemu-manager-list-clone)
     (define-key map (kbd "n")   #'next-line)
     (define-key map (kbd "p")   #'previous-line)
@@ -1067,9 +1224,12 @@ via `read-file-name'.  DISK, MEMORY, and CPUS are prompted with defaults."
   (qemu-manager-dired (qemu-manager-list--current-name)))
 
 (defun qemu-manager-list-eshell ()
-  "Open eshell on the VM at point via TRAMP."
+  "Open eshell on the VM at point via TRAMP.
+With prefix arg, prompt for an absolute remote start path."
   (interactive)
-  (qemu-manager-eshell (qemu-manager-list--current-name)))
+  (qemu-manager-eshell (qemu-manager-list--current-name)
+                       (when current-prefix-arg
+                         (read-string "Remote start path: " "/"))))
 
 (defun qemu-manager-list-info ()
   "Show info for the VM at point."
@@ -1107,6 +1267,18 @@ via `read-file-name'.  DISK, MEMORY, and CPUS are prompted with defaults."
   "Push SSH public key to the VM at point."
   (interactive)
   (qemu-manager-ssh-copy-id (qemu-manager-list--current-name)))
+
+(defun qemu-manager-list-share-set ()
+  "Configure the virtiofs shared folder for the VM at point."
+  (interactive)
+  (let* ((name (qemu-manager-list--current-name))
+         (conf (qemu-manager--read-conf name))
+         (current-path (or (qemu-manager--conf-get conf "SHARE_PATH") ""))
+         (current-tag (or (qemu-manager--conf-get conf "SHARE_TAG") "hostshare"))
+         (path (read-string (format "Host path to share for '%s' (empty to disable): " name)
+                            current-path))
+         (tag (if (string-empty-p path) "" (read-string "Mount tag: " current-tag))))
+    (qemu-manager-share-set name path tag)))
 
 (defun qemu-manager-list-scp ()
   "SCP files to the VM at point."
@@ -1198,6 +1370,7 @@ via `read-file-name'.  DISK, MEMORY, and CPUS are prompted with defaults."
    ["Tools"
     ("S" "Send files (rsync)" qemu-manager-list-scp)
     ("P" "Push SSH key"       qemu-manager-list-ssh-copy-id)
+    ("F" "Shared folder"      qemu-manager-list-share-set)
     ("D" "Toggle display"     qemu-manager-list-display)
     ("k" "Keyboard setup"     qemu-manager-list-keyboard)
     ("w" "Clipboard copy"     qemu-manager-list-clip-copy)

@@ -1,6 +1,6 @@
 #+title: qemu-manager.el --- QEMU VM manager for Emacs
 #+author: James Dyer
-#+version: 1.0.0
+#+version: 1.1.0
 
 *qemu-manager.el* manages QEMU virtual machines directly from Emacs. It calls ~qemu-system-x86_64~, ~qemu-img~, ~vncviewer~, ~spicy~, ~ssh~, and ~rsync~ directly -- no external wrapper script required.
 
@@ -12,6 +12,7 @@
 - *TRAMP Integration*: Quickly open /dired/ or an /eshell/ on a running VM via SSH (localhost tunneling).
 - *Display Support*: Launch VNC or SPICE viewers for any running VM. SPICE provides clipboard sharing, dynamic resolution, and better keyboard input handling.
 - *File Transfer*: Easily rsync files (or dired marked files) to a VM.
+- *Shared Folders*: Share host directories into a VM via virtiofs. qemu-manager launches and supervises ~virtiofsd~ alongside the VM automatically.
 - *Clipboard Sharing*: Copy/paste between host and VM over SSH (~w~ / ~y~), with auto-detection of guest clipboard tools (wl-clipboard, xclip, xsel). Works with both VNC and SPICE.
 - *Keyboard Setup*: Configure keyboard remaps (CapsLock/Right Alt → Ctrl) and sticky keys on GNOME VM guests via SSH.
 - *Display Switching*: Toggle between VNC and SPICE display types without recreating the VM.
@@ -36,6 +37,7 @@ External tools (must be in ~PATH~):
 | ~spicy~                | SPICE display (from ~spice-gtk~)         |
 | ~ssh~ / ~ssh-copy-id~  | Remote commands, key setup               |
 | ~rsync~                | File transfer to VMs                     |
+| ~virtiofsd~            | Shared folders (virtiofs), optional      |
 | ~wl-copy~ / ~wl-paste~ | Host clipboard (Wayland)                 |
 
 * Installation
@@ -88,6 +90,7 @@ Run ~M-x qemu-manager-list~ to open the VM manager buffer, then press ~?~ to ope
 | ~e~         | Open eshell on VM via TRAMP                 |
 | ~S~         | SCP marked files to VM                      |
 | ~P~         | Push SSH key for passwordless access        |
+| ~F~         | Configure virtiofs shared folder            |
 | ~i~         | Show VM info                                |
 | ~g~         | Refresh VM list                             |
 | ~q~         | Quit window                                 |
@@ -146,6 +149,28 @@ This applies to GNOME Wayland guests:
 
 Log out and back in to the guest for changes to take effect.
 
+** Shared Folders (virtiofs)
+
+Share a host directory into a VM via virtiofs. Press ~F~ in the list buffer (or ~M-x qemu-manager-share-set~) to set a host path and mount tag, then start the VM. An empty path clears the share.
+
+When a share is configured, ~qemu-manager-start~ launches ~virtiofsd~ on a Unix socket in the VM directory and adds the matching ~memory-backend-memfd~, ~vhost-user-fs-pci~, and chardev args to QEMU. The daemon is terminated automatically when the VM exits.
+
+Mount the share from inside the guest (using the tag you chose):
+
+#+begin_src sh :tangle no
+sudo mount -t virtiofs hostshare /mnt/host
+#+end_src
+
+Or add it to ~/etc/fstab~:
+
+#+begin_src conf :tangle no
+hostshare  /mnt/host  virtiofs  defaults  0  0
+#+end_src
+
+Requires a Linux guest with ~virtiofs~ kernel support (5.4+) and ~virtiofsd~ on the host. qemu-manager looks for the daemon in ~PATH~ and then falls back to ~/usr/lib/virtiofsd~ (Arch), ~/usr/libexec/virtiofsd~ (Fedora/RHEL), and ~/usr/lib/qemu/virtiofsd~; set ~qemu-manager-virtiofsd-binary~ if yours lives elsewhere.
+
+Virtiofsd is launched with ~--sandbox=none~ by default so it can run as a regular user -- the ~namespace~ sandbox mode needs ~CAP_SYS_ADMIN~. If you run qemu-manager as root (or with the right capabilities), remove it from ~qemu-manager-virtiofsd-args~ for stronger isolation.
+
 ** Clipboard Sharing (VNC)
 
 SPICE provides native clipboard sharing via ~spice-vdagent~. For VNC mode (or as a fallback), clipboard can be shared over SSH:
@@ -167,6 +192,8 @@ Requires ~wl-copy~ / ~wl-paste~ on the host (included with sway).
 | ~qemu-manager-vnc-viewer~          | VNC viewer program                          | =vncviewer= in PATH          |
 | ~qemu-manager-vnc-viewer-args~     | Extra args for VNC viewer                   | =("-RemoteResize=1")=        |
 | ~qemu-manager-spice-viewer~        | SPICE viewer program                        | =spicy= in PATH              |
+| ~qemu-manager-virtiofsd-binary~    | Path to virtiofsd daemon                    | =virtiofsd= / =/usr/libexec/virtiofsd= |
+| ~qemu-manager-virtiofsd-args~      | Extra args for virtiofsd                    | =("--cache=auto")=           |
 | ~qemu-manager-default-memory~      | Default memory for new VMs                  | ="4G"=                       |
 | ~qemu-manager-default-cpus~        | Default CPU count for new VMs               | ="4"=                        |
 | ~qemu-manager-default-disk~        | Default disk size for new VMs               | ="40G"=                      |
