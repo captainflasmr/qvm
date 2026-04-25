@@ -42,7 +42,7 @@
 ;; Keybindings in the VM list buffer:
 ;;   RET / r  -- run (start + viewer)
 ;;   s        -- start
-;;   x        -- stop (with confirmation)
+;;   k / x    -- stop (with confirmation)
 ;;   c        -- create new VM (prompts for name, ISO, disk/mem/cpus)
 ;;   v        -- open VNC viewer
 ;;   V        -- open SPICE viewer
@@ -1294,6 +1294,7 @@ via `read-file-name'.  DISK, MEMORY, and CPUS are prompted with defaults."
     (define-key map (kbd "j")   #'qemu-manager-list-run)
     (define-key map (kbd "m")   #'qemu-manager-list-start)
     (define-key map (kbd "k")   #'qemu-manager-list-stop)
+    (define-key map (kbd "x")   #'qemu-manager-list-stop)
     (define-key map (kbd "c")   #'qemu-manager-list-create)
     (define-key map (kbd "v")   #'qemu-manager-list-vnc)
     (define-key map (kbd "V")   #'qemu-manager-list-spice)
@@ -1562,6 +1563,7 @@ With prefix arg, prompt for an absolute remote start path."
     ("m" "Start (headless)"   qemu-manager-list-start)
     ("j" "Run (start+viewer)" qemu-manager-list-run)
     ("k" "Stop (kill)"        qemu-manager-list-stop)
+    ("x" "Stop (kill)"        qemu-manager-list-stop)
     ("c" "Create new VM"      qemu-manager-list-create)
     ("C" "Clone"              qemu-manager-list-clone)]
    ["Connect"
@@ -1589,6 +1591,7 @@ With prefix arg, prompt for an absolute remote start path."
    ("l" "Open VM list"       qemu-manager-list)
    ("m" "Start VM (headless)" qemu-manager-start)
    ("k" "Stop VM"             qemu-manager-stop)
+   ("x" "Stop VM"             qemu-manager-stop)
    ("j" "Run VM (start+viewer)" qemu-manager-run)
    ("c" "Create new VM"      qemu-manager-create)
    ("i" "VM info"            qemu-manager-info)])
